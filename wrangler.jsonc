@@ -1,0 +1,31 @@
+{
+	"$schema"            : "node_modules/wrangler/config-schema.json",
+	"name"               : "homebrewery",
+	"main"               : "worker/index.js",
+	"compatibility_date" : "2026-10-01",
+	"compatibility_flags": ["nodejs_compat"],
+
+	// Builds the client bundle into ./build before every `wrangler dev` / `wrangler deploy`
+	"build" : {
+		"command" : "npm run build"
+	},
+
+	// Static client assets. Requests matching a file in ./build are served without invoking
+	// the Worker. html_handling "none" keeps "/" from resolving to build/index.html, so page
+	// routes reach the Worker, which injects the page props into that HTML.
+	"assets" : {
+		"directory"     : "./build",
+		"binding"       : "ASSETS",
+		"html_handling" : "none"
+	},
+
+	// Markdown page content is bundled into the Worker as text modules
+	"rules" : [
+		{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }
+	],
+
+	"workers_dev"   : true,
+	"observability" : {
+		"enabled" : true
+	}
+}

@@ -14,6 +14,8 @@
   "scripts": {
     "start": "node server.js",
     "build": "vite build",
+    "dev:worker": "wrangler dev",
+    "deploy": "wrangler deploy",
     "lint": "eslint --fix",
     "lint:dry": "eslint",
     "stylelint": "stylelint --fix **/*.{less}",
@@ -43,7 +45,6 @@
     "test:helpers": "jest tests/html/helpers.test.js --verbose",
     "phb": "node --experimental-require-module scripts/phb.js",
     "prod": "set NODE_ENV=production && npm run build",
-    "postinstall": "npm run build",
     "docker:build": "docker build -t ${DOCKERID}/homebrewery:$npm_package_version .",
     "docker:publish": "docker login && docker push  ${DOCKERID}/homebrewery:$npm_package_version"
   },
@@ -133,7 +134,6 @@
     "mongoose": "^9.11.2",
     "nanoid": "6.0.2",
     "nconf": "^0.13.0",
-    "node": "^26.12.0",
     "prettier": "^3.9.10",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
@@ -159,6 +159,7 @@
     "stylelint-config-recess-order": "^7.7.0",
     "stylelint-config-recommended": "^18.0.0",
     "supertest": "^7.3.1",
-    "vite": "^8.3.4"
+    "vite": "^8.3.4",
+    "wrangler": "4.152.0"
   }
 }
