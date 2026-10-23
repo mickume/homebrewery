@@ -1,0 +1,14 @@
+# Cache rules for Workers Static Assets (copied into build/ by vitePlugins/generateAssetsPlugin.js).
+# Fonts, images and icons rarely change: cache for 30 days. Scripts and theme CSS: 12 hours.
+/assets/*
+  Cache-Control: public, max-age=2592000, must-revalidate
+/fonts/*
+  Cache-Control: public, max-age=2592000, must-revalidate
+/icons/*
+  Cache-Control: public, max-age=2592000, must-revalidate
+/themes/*
+  Cache-Control: public, max-age=43200, must-revalidate
+/*.js
+  Cache-Control: public, max-age=43200, must-revalidate
+/*.css
+  Cache-Control: public, max-age=43200, must-revalidate

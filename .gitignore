@@ -5,13 +5,8 @@ node_modules
 
 *.log
 build/*
-config/local.*
-config/docker.*
-config/dev.*
 
 todo.md
-startDB.bat
-startMViewer.bat
 .vscode
 
 coverage

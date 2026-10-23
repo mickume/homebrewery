@@ -2,7 +2,8 @@
 
 ## Status
 
-Accepted (2026-10-23). Implementation is in progress; see "Migration steps".
+Accepted (2026-10-23), implemented. The runtime and live-update decisions are superseded by
+[ADR 02](02-use-hono-and-web-standard-apis-on-workers.md); the rest stands.
 
 ## Context
 
@@ -29,7 +30,8 @@ The project is greenfield: there is no existing MongoDB data to migrate.
 - **Runtime:** keep the Express app and run it on Workers through the Node.js HTTP
   server compatibility layer (`httpServerHandler` from `cloudflare:node`, with the
   `nodejs_compat` flag). This keeps route code and the supertest-based tests largely
-  unchanged. Hono is the fallback if this layer proves insufficient.
+  unchanged. Hono is the fallback if this layer proves insufficient. *(Superseded: ADR 02
+  moves to Hono.)*
 - **Static assets:** served by Workers Static Assets from `build/` (binding `ASSETS`).
   `html_handling` is `none` so page routes reach the Worker, which injects the page
   props into `index.html`.
@@ -42,7 +44,7 @@ The project is greenfield: there is no existing MongoDB data to migrate.
 - **Google Drive storage:** removed. All brews live in D1.
 - **Live share-page updates:** `/api/stream/:id` answers `204 No Content`, which tells
   the browser's `EventSource` to stop reconnecting. A Durable Object can restore the
-  feature later.
+  feature later. *(Superseded: ADR 02 restores the feature with a Durable Object.)*
 - **Authentication:** unchanged for now (the `nc_session` JWT cookie from
   naturalcrit.com, plus `/local/login` in local environments). Real sign-in for this
   deployment is a later functional change.
@@ -58,9 +60,8 @@ The project is greenfield: there is no existing MongoDB data to migrate.
 
 ## Migration steps
 
-1. Tooling baseline: `wrangler.jsonc`, a spike Worker running Express, `make check`.
-2. Storage layer over D1 with the first migration, tested against `node:sqlite` and a local D1.
-3. Replace Mongoose with the storage layer; remove Google Drive.
-4. Make the server Workers-safe (config, bundled files, hashing, static assets).
-5. Serve the full app from the Worker; local development through the Cloudflare Vite plugin.
-6. Final documentation pass.
+1. Tooling baseline: `wrangler.jsonc`, a spike Worker running Express, `make check` (PR #1).
+2. Storage layer over D1 with the first migration, tested against `node:sqlite` and a local D1 (PR #2).
+3. to 6. Done together with ADR 02: the routes on Hono and D1, Google Drive removed, Worker-safe
+   configuration and assets, the full app served from the Worker, documentation. Local
+   development uses `wrangler dev` rather than the Cloudflare Vite plugin (see ADR 02).
