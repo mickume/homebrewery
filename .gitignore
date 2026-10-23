@@ -1,5 +1,5 @@
 node_modules
-storage
+/storage
 .idea
 *.swp
 
@@ -17,3 +17,4 @@ startMViewer.bat
 coverage
 .wrangler
 .dev.vars*
+!tests/support/.dev.vars
