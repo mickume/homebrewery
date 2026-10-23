@@ -15,6 +15,7 @@ The Worker is configured in `wrangler.jsonc`:
 | `assets.html_handling` | `none` | Keeps `/` from resolving to `build/index.html` |
 | `rules` | `**/*.md` as Text | Bundles markdown page content into the Worker |
 | `previews` | `{}` | Required by `wrangler preview`, which Workers Builds runs for non-`main` branches |
+| `workers_dev`, `preview_urls` | `true` | Serve production at `homebrewery.m-2d9.workers.dev` and give branch previews their own `workers.dev` URL (takes effect after a production deploy) |
 
 The Worker does not read any variables or secrets yet.
 
