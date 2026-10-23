@@ -42,8 +42,8 @@ Run the quality gate (lint, Worker build, tests) with `make check`.
 ## Deployment
 
 Pushes to `main` deploy through Cloudflare Workers Builds (`npx wrangler deploy`); other branches
-get a preview with their own database (`npx wrangler preview`). The first deploy creates the D1
-databases `homebrewery` and `homebrewery-preview`. Production runs at
+get a preview with their own database (`npx wrangler preview`): D1 databases `homebrewery` and
+`homebrewery-preview`, whose ids are in `wrangler.jsonc`. Production runs at
 `https://homebrewery.m-2d9.workers.dev`.
 
 Admin access and sign-in need secrets on the Worker; see

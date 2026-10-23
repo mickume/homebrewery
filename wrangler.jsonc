@@ -29,10 +29,9 @@
 		"ENVIRONMENT" : "production"
 	},
 
-	// No database_id: Wrangler provisions the database on the first deploy and reuses it after.
-	// The Worker applies pending migrations itself (server/storage/migrate.js).
+	// The Worker applies pending migrations itself (server/storage/migrate.js)
 	"d1_databases" : [
-		{ "binding": "DB", "database_name": "homebrewery", "migrations_dir": "migrations" }
+		{ "binding": "DB", "database_name": "homebrewery", "database_id": "63abfe96-c07f-4705-8b1c-2d59a4e9de02", "migrations_dir": "migrations" }
 	],
 
 	// Live share-page updates (worker/brewUpdates.js)
@@ -51,7 +50,7 @@
 			"ENVIRONMENT" : "preview"
 		},
 		"d1_databases" : [
-			{ "binding": "DB", "database_name": "homebrewery-preview", "migrations_dir": "migrations" }
+			{ "binding": "DB", "database_name": "homebrewery-preview", "database_id": "ac9066b1-0a92-4feb-b304-052d5ec143d7", "migrations_dir": "migrations" }
 		],
 		"durable_objects" : {
 			"bindings" : [

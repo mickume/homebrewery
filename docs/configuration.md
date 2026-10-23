@@ -33,9 +33,9 @@ Local development takes its values from the `--var` flags in the `dev` script; a
 | `assets` | `./build`, binding `ASSETS`, `html_handling: none` | Static client files served without invoking the Worker; `/` still reaches the Worker |
 | `rules` | `**/*.md`, `**/*.sql` as Text | Bundles page markdown and migrations into the Worker |
 | `vars` | `ENVIRONMENT: production` | See above |
-| `d1_databases` | `DB` → `homebrewery` | Production database. No `database_id`: the first deploy provisions it |
+| `d1_databases` | `DB` → `homebrewery` (`63abfe96-…`) | Production database |
 | `durable_objects`, `migrations` | `BREW_UPDATES` → `BrewUpdates` (SQLite-backed, tag `v1`) | Live share-page updates |
-| `previews` | `ENVIRONMENT: preview`, `DB` → `homebrewery-preview`, `BREW_UPDATES` | Branch previews (`wrangler preview`) use their own database |
+| `previews` | `ENVIRONMENT: preview`, `DB` → `homebrewery-preview` (`ac9066b1-…`), `BREW_UPDATES` | Branch previews (`wrangler preview`) use their own database. `wrangler preview` requires an explicit `database_id` |
 | `workers_dev`, `preview_urls` | `true` | Production at `homebrewery.m-2d9.workers.dev`; previews at `<branch>-homebrewery.m-2d9.workers.dev` |
 | `observability` | enabled | Workers Logs |
 

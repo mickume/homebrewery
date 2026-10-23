@@ -37,9 +37,10 @@ pieces had no good equivalent on Workers:
 - **Configuration from bindings:** `vars` in `wrangler.jsonc` (`ENVIRONMENT`) and secrets
   (`JWT_SECRET`, `ADMIN_PASSWORD`). Admin is off without an admin password; nobody is signed in
   without a JWT secret.
-- **Databases provisioned by Wrangler and migrated by the Worker.** D1 bindings name their
-  database without an id; the first deploy creates it. Branch previews bind their own
-  database (`previews.d1_databases`). The Worker applies pending migrations on the first
+- **Separate production and preview databases, migrated by the Worker.** `homebrewery` and
+  `homebrewery-preview` are bound by id (`wrangler preview` does not provision databases the
+  way `wrangler deploy` does). Branch previews bind their own database
+  (`previews.d1_databases`). The Worker applies pending migrations on the first
   request of each isolate, recorded in Wrangler's `d1_migrations` table, so no deploy step is
   needed and previews can never migrate the production database.
 - **Static assets are Cloudflare's job:** cache rules in `_headers`, `robots.txt` as an asset,
