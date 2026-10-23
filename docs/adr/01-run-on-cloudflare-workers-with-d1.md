@@ -37,7 +37,8 @@ The project is greenfield: there is no existing MongoDB data to migrate.
   under `.wrangler/state`, so no database server is needed. Schema changes are SQL
   migrations. Brew text stays deflate-compressed in a BLOB column; D1's 2 MB row limit
   caps the size of a single brew. Authors move to a join table so author queries are
-  indexed; Vault title search uses FTS5.
+  indexed. Vault title search matches every word of the query with `LIKE` (case-insensitive)
+  rather than FTS5, because `wrangler d1 export` cannot export databases containing virtual tables.
 - **Google Drive storage:** removed. All brews live in D1.
 - **Live share-page updates:** `/api/stream/:id` answers `204 No Content`, which tells
   the browser's `EventSource` to stop reconnecting. A Durable Object can restore the
@@ -58,7 +59,7 @@ The project is greenfield: there is no existing MongoDB data to migrate.
 ## Migration steps
 
 1. Tooling baseline: `wrangler.jsonc`, a spike Worker running Express, `make check`.
-2. Storage layer over D1 with the first migration, tested against `node:sqlite`.
+2. Storage layer over D1 with the first migration, tested against `node:sqlite` and a local D1.
 3. Replace Mongoose with the storage layer; remove Google Drive.
 4. Make the server Workers-safe (config, bundled files, hashing, static assets).
 5. Serve the full app from the Worker; local development through the Cloudflare Vite plugin.
