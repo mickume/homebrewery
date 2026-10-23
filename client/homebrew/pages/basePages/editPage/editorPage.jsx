@@ -2,7 +2,7 @@ import React, { useState, useEffect, useEffectEvent, useRef } from 'react';
 import { printCurrentBrew, fetchThemeBundle } from '@shared/helpers.js';
 import _                                      from 'lodash';
 import { hbfm }                               from 'marked-hbfm';
-import { md5 }                                from 'hash-wasm';
+import { sha256 }                             from '@shared/hash.js';
 import { makePatches, stringifyPatches }      from '@sanity/diff-match-patch';
 
 import Headtags         from '@vitreum/headtags.js';
@@ -24,14 +24,12 @@ import PrintNavItem   from '@navbar/print.navitem.jsx';
 import ShareNavItem   from '@navbar/share.navitem.jsx';
 import RecentNavItems from '@navbar/recent.navitem.jsx';
 const { both: RecentNavItem } = RecentNavItems;
-import googleDriveIcon from '../../../googleDrive.svg';
 
 const AUTOSAVE_KEY   = 'HB_editor_autoSaveOn';
 const BREWKEY        = 'HB_newPage_content';
 const STYLEKEY       = 'HB_newPage_style';
 const SNIPKEY        = 'HB_newPage_snippets';
 const METAKEY        = 'HB_newPage_meta';
-const SAVEKEY_PREFIX = 'HB_editor_defaultSave_';
 
 const SAVE_TIMEOUT                  = 10000;  //Autosave 10 seconds after last change
 const UNSAVED_WARNING_TIMEOUT       = 900000; //Warn user afer 15 minutes of unsaved changes
@@ -58,13 +56,7 @@ const EditorPage = (props)=>{
 	const [unsavedChanges, setUnsavedChanges]         = useState(false);
 	const [themeBundle, setThemeBundle]               = useState({});
 	const [HTMLErrors, setHTMLErrors]                 = useState(hbfm.validate(currentBrew.text));
-	const [saveGoogle, setSaveGoogle]                 = useState(currentBrew.googleId);
 	const [error, setError]                           = useState(null);
-
-	const [alertTrashedGoogleBrew, setAlertTrashedGoogleBrew]     = useState(currentBrew.trashed);
-	const [alertNoGoogleToTransfer, setAlertNoGoogleToTransfer]   = useState(false);
-	const [alertOwnershipToTransfer, setAlertOwnershipToTransfer] = useState(false);
-	const [confirmGoogleTransfer, setConfirmGoogleTransfer]       = useState(false);
 
 	const [currentEditorViewPageNum, setCurrentEditorViewPageNum] = useState(1);
 	const [currentEditorCursorPageNum, setCurrentEditorCursorPageNum] = useState(1);
@@ -86,7 +78,7 @@ const EditorPage = (props)=>{
 
 		const handleControlKeys = (e)=>{
 			if(!(e.ctrlKey || e.metaKey)) return;
-			if(e.keyCode === 83) trySave(true, true, saveGoogle);
+			if(e.keyCode === 83) trySave(true);
 			if(e.keyCode === 80) printCurrentBrew();
 			if([83, 80].includes(e.keyCode)) {
 				e.stopPropagation();
@@ -123,12 +115,8 @@ const EditorPage = (props)=>{
 			brew.lang        = metaStorage?.lang        ?? brew.lang;
 		}
 
-		const SAVEKEY = `${SAVEKEY_PREFIX}${global.account?.username}`;
-		const saveStorage = localStorage.getItem(SAVEKEY) || 'HOMEBREWERY';
-
 		setCurrentBrew(brew);
 		lastSavedBrew.current = brew;
-		setSaveGoogle(saveStorage == 'GOOGLE-DRIVE' && saveGoogle);
 
 		                  localStorage.setItem(BREWKEY,  brew.text);
 		if(brew.style)    localStorage.setItem(STYLEKEY, brew.style);
@@ -151,7 +139,7 @@ const EditorPage = (props)=>{
 		setUnsavedChanges(hasChange);
 		unsavedChangesRef.current = hasChange;
 
-		if(autoSaveEnabled) trySave(false, hasChange, saveGoogle);
+		if(autoSaveEnabled) trySave(false, hasChange);
 	}, [currentBrew]);
 
 	const resetWarnUnsavedTimer = ()=>{
@@ -203,7 +191,7 @@ const EditorPage = (props)=>{
 		setIsSaving(false);
 	};
 
-	const trySave = useEffectEvent((forceSave = false, hasChanges = true, saveToGoogle = false)=>{
+	const trySave = useEffectEvent((forceSave = false, hasChanges = true)=>{
 		clearTimeout(saveTimeout.current);
 		if(isSaving) return;
 		if(!forceSave && !hasChanges) return;
@@ -221,12 +209,12 @@ const EditorPage = (props)=>{
 				text      : currentBrew.text.normalize('NFC'),
 				pageCount : ((currentBrew.renderer === 'legacy' ? currentBrew.text.match(/\\page/g) : currentBrew.text.match(/^(?=\\page(?:break)?(?: *{[^\n{}]*})?$)/gm)) || []).length + 1,
 				patches   : stringifyPatches(makePatches(encodeURI(lastSavedBrew.current.text.normalize('NFC')), encodeURI(currentBrew.text.normalize('NFC')))),
-				hash      : await md5(lastSavedBrew.current.text.normalize('NFC')),
+				hash      : await sha256(lastSavedBrew.current.text.normalize('NFC')),
 				textBin   : undefined,
 				version   : lastSavedBrew.current.version
 			};
 
-			const savedBrew = await save(brewToSave, saveToGoogle)
+			const savedBrew = await save(brewToSave)
 				.catch((err)=>{
 					console.error('Error Updating Local Brew');
 					setError(err);
@@ -269,7 +257,7 @@ const EditorPage = (props)=>{
 		}
 
 		if(unsavedChanges)
-			return <Nav.item className='save' onClick={()=>trySave(true, true, saveGoogle)} color='blue' icon='fas fa-save'>save now</Nav.item>;
+			return <Nav.item className='save' onClick={()=>trySave(true)} color='blue' icon='fas fa-save'>save now</Nav.item>;
 
 		if(autoSaveEnabled)
 			return <Nav.item className='save saved'>auto-saved</Nav.item>;
@@ -288,81 +276,6 @@ const EditorPage = (props)=>{
 		snippets : newData.snippets
 	}));
 
-	//======----- Google Toggle Button -----======
-	const closeAlerts = (e)=>{
-		e.stopPropagation(); //Only handle click once so alert doesn't reopen
-		setAlertTrashedGoogleBrew(false);
-		setAlertNoGoogleToTransfer(false);
-		setConfirmGoogleTransfer(false);
-		setAlertOwnershipToTransfer(false);
-	};
-
-	const handleGoogleClick = ()=>{
-		if(currentBrew.authors.length > 0 && global.account?.username !== currentBrew.authors[0]) {
-			setAlertOwnershipToTransfer(true);
-			return;
-		}
-		if(!global.account?.googleId) {
-			setAlertNoGoogleToTransfer(true);
-			return;
-		}
-
-		setConfirmGoogleTransfer((prev)=>!prev);
-		setError(null);
-	};
-
-	const toggleGoogleStorage = (e)=>{
-		closeAlerts(e);
-		const newSaveGoogle = !saveGoogle;
-		setSaveGoogle((prev)=>!prev);
-		setError(null);
-		trySave(true, true, newSaveGoogle);
-	};
-
-	const renderGoogleDriveIcon = ()=>(
-		<Nav.item className='googleDriveStorage' onClick={handleGoogleClick}>
-			<img src={googleDriveIcon} className={saveGoogle ? '' : 'inactive'} alt='Google Drive icon' />
-
-			{alertOwnershipToTransfer && (
-				<div className='errorContainer'>
-					You must be the Owner to transfer between the Homebrewery and Google Drive!
-					The owner of this file is {currentBrew.authors[0]}.
-					<br></br>
-					<div className='confirm' onClick={closeAlerts}> Okay </div>
-				</div>
-			)}
-
-			{alertNoGoogleToTransfer && (
-				<div className='errorContainer'>
-					You must be signed in to a Google account to transfer between the Homebrewery and Google Drive!
-					<a target='_blank' rel='noopener noreferrer' href={`https://www.naturalcrit.com/login?redirect=${window.location.href}`}>
-						<div className='confirm' onClick={closeAlerts}> Sign In </div>
-					</a>
-					<div className='deny'  onClick={closeAlerts}>      Not Now </div>
-				</div>
-			)}
-
-			{alertTrashedGoogleBrew && (
-				<div className='errorContainer'>
-					This brew is currently in your Trash folder on Google Drive!<br />
-					If you want to keep it, make sure to move it before it is deleted permanently!<br />
-					<div className='confirm' onClick={toggleGoogleStorage}> Save my brew </div>
-				</div>
-			)}
-
-			{confirmGoogleTransfer && (
-				<div className='errorContainer'>
-					{saveGoogle
-						? 'Would you like to transfer this brew from your Google Drive storage back to the Homebrewery?'
-						: 'Would you like to transfer this brew from the Homebrewery to your personal Google Drive storage?'}
-					<br />
-					<div className='confirm' onClick={toggleGoogleStorage}> Yes </div>
-					<div className='deny' onClick={closeAlerts}>                                  No  </div>
-				</div>
-			)}
-		</Nav.item>
-	);
-
 	//======----- Navbar -----======
 	const renderNavbar = ()=>(
 		<Navbar>
@@ -370,7 +283,6 @@ const EditorPage = (props)=>{
 				<Nav.item className='brewTitle'>{currentBrew.title}</Nav.item>
 			</Nav.section>
 			<Nav.section>
-				{(pageName == 'editPage') && renderGoogleDriveIcon()}
 				{error
 					? <ErrorNavItem error={error} clearError={clearError} />
 					: <Nav.dropdown className='save-menu'>
@@ -396,7 +308,7 @@ const EditorPage = (props)=>{
 
 	const renderFloatingSaveButtons = ()=>(
 		<>
-			<div className={`floatingSaveButton${unsavedChanges ? ' show' : ''}`} onClick={()=>trySave(true, true, saveGoogle)}>
+			<div className={`floatingSaveButton${unsavedChanges ? ' show' : ''}`} onClick={()=>trySave(true)}>
 				Save current <i className='fas fa-save' />
 			</div>
 			<a href='/new' className='floatingNewButton'>
@@ -407,7 +319,6 @@ const EditorPage = (props)=>{
 
 	return (
 		<div className= {`${pageName} sitePage`}>
-			<Meta name='google-site-verification' content='NwnAQSSJZzAT7N-p5MY6ydQ7Njm67dtbu73ZSyE5Fy4' />
 			{(pageName == 'editPage') && <Meta name='robots' content='noindex, nofollow' />}
 			{renderNavbar()}
 			{currentBrew.lock && <LockNotification shareId={currentBrew.shareId} message={currentBrew.lock.editMessage} reviewRequested={currentBrew.lock.reviewRequested}/>}

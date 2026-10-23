@@ -12,9 +12,9 @@ const HomePage =(props)=>{
 		...props
 	};
 
-	const save = async (brew, saveToGoogle)=>{
+	const save = async (brew)=>{
 		const res = await request
-			.post(`/api${saveToGoogle ? '?saveToGoogle=true' : ''}`)
+			.post('/api')
 			.send(brew);
 
 		return res.body;

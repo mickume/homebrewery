@@ -2,7 +2,6 @@ import './editPage.less';
 
 import React                 from 'react';
 import request               from '../../utils/request-middleware.js';
-import _                     from 'lodash';
 import EditorPage            from '../basePages/editPage/editorPage.jsx';
 import { DEFAULT_BREW_LOAD } from '../../../../server/brewDefaults.js';
 
@@ -16,25 +15,21 @@ const EditPage = (props)=>{
 		...props
 	};
 
-	const save = async (brew, saveToGoogle)=>{
+	const save = async (brew)=>{
 		await updateHistory(brew).catch(console.error);
 		await versionHistoryGarbageCollection().catch(console.error);
 
 		const compressedBrew = gzipSync(strToU8(JSON.stringify(brew)));
-		const transfer = saveToGoogle === _.isNil(brew.googleId);
-		const params = transfer ? `?${saveToGoogle ? 'saveToGoogle' : 'removeFromGoogle'}=true` : '';
-
 		const res = await request
-			.put(`/api/update/${brew.editId}${params}`)
+			.put(`/api/update/${brew.editId}`)
 			.set('Content-Encoding', 'gzip')
 			.set('Content-Type', 'application/json')
 			.send(compressedBrew);
 
 		const updatedFields = {
-			googleId : res.body.googleId ?? null, //TODO: investigate if we can set googleId:null in server/update instead of undefined
-			editId   : res.body.editId,           //then, editPage can just apply res.body instead of breaking out these fields.
-			shareId  : res.body.shareId,
-			version  : res.body.version
+			editId  : res.body.editId,
+			shareId : res.body.shareId,
+			version : res.body.version
 		};
 
 		return updatedFields;
