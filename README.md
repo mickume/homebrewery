@@ -86,6 +86,21 @@ If you had any issue at all, here are some links that may be useful:
 
 If you still have problems, post in [Our Subreddit](https://www.reddit.com/r/homebrewery/) and we will help you.
 
+### Running on Cloudflare Workers
+
+This fork is moving from Node.js and MongoDB to Cloudflare Workers with D1
+(see [ADR 01](./docs/adr/01-run-on-cloudflare-workers-with-d1.md)). During the
+migration the Worker serves only the home page; the full app still runs through
+`npm start` as described above.
+
+1. `npm install`
+1. `npm run dev:worker` builds the client and runs the Worker locally at
+   [http://localhost:8787](http://localhost:8787).
+1. `make check` runs lint, a dry-run Worker build and the tests.
+
+Pushes to `main` deploy through Cloudflare's GitHub integration. See
+[docs/cli.md](./docs/cli.md) and [docs/configuration.md](./docs/configuration.md).
+
 ### Running the application via Docker
 
 Please see the docs here: [README.DOCKER.md](./README.DOCKER.md)

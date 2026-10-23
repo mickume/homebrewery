@@ -3,7 +3,7 @@ import jest from "eslint-plugin-jest";
 import globals from "globals";
 
 export default [{
-		ignores: ["build/"]
+		ignores: ["build/", ".wrangler/"]
 	},
 	{
 		files           : ['**/*.js', '**/*.jsx'],
