@@ -1,1383 +1,277 @@
 /* eslint-disable max-lines */
-
+import { gzipSync, strToU8 } from 'fflate';
+import { createTestApp, createFakeUpdates } from '../tests/support/testApp.js';
+import { sha256 } from '../shared/hash.js';
 import { splitTextStyleAndMetadata } from '../shared/helpers.js';
-import dedent from 'dedent';
+import createBrewStore from './storage/brewStore.js';
 
-describe('Tests for api', ()=>{
-	let api;
-	let google;
-	let model;
-	let hbBrew;
-	let googleBrew;
-	let res;
+describe('Brew API', ()=>{
+	let t;
 
-	let modelBrew;
-	let saveFunc;
-	let markModifiedFunc;
-	let saved;
+	const createBrew = async (body, as)=>(await t.send('POST', '/api', { body, as })).json();
+	const storedBrew = (editId)=>t.db.prepare('SELECT * FROM brews WHERE edit_id = ?').bind(editId).first();
 
-	beforeEach(()=>{
-		jest.resetModules();
-		jest.restoreAllMocks();
+	// The brew as the editor holds it: stored text split into metadata, style and markdown
+	const editorCopy = async (editId)=>{
+		const brew = await createBrewStore(t.db).getByEditId(editId);
+		splitTextStyleAndMetadata(brew);
+		return brew;
+	};
 
-		saved = undefined;
-		saveFunc = jest.fn(async function() {
-			saved = { ...this, _id: '1' };
-			return saved;
-		});
-		markModifiedFunc = jest.fn(()=>true);
+	// Saves like the editor: the full brew plus the hash of the last saved text and that text's version
+	const saveBrew = async (editId, changes, { as } = {})=>{
+		const current = await editorCopy(editId);
+		const body = { ...current, ...changes, hash: changes.hash ?? await sha256(current.text.normalize('NFC')), version: changes.version ?? current.version };
+		return t.send('PUT', `/api/update/${editId}`, { body, as });
+	};
 
-		modelBrew = (brew)=>({
-			...brew,
-			save         : saveFunc,
-			markModified : markModifiedFunc,
-			toObject     : function() {
-				delete this.save;
-				delete this.toObject;
-				delete this.markModified;
-				return this;
-			}
-		});
-
-		google = require('./googleActions.js').default;
-		model  = require('./homebrew.model.js').model;
-		api    = require('./homebrew.api').default;
-
-		jest.mock('./googleActions.js');
-		google.authCheck = jest.fn(()=>'client');
-		google.newGoogleBrew = jest.fn(()=>'id');
-		google.deleteGoogleBrew = jest.fn(()=>true);
-
-		jest.mock('./homebrew.model.js');
-		model.mockImplementation((brew)=>modelBrew(brew));
-
-		res = {
-			status    : jest.fn(()=>res),
-			send      : jest.fn(()=>{}),
-			set       : jest.fn(()=>{}),
-			setHeader : jest.fn(()=>{})
-		};
-
-		hbBrew = {
-			text        : `brew text`,
-			style       : 'hello yes i am css',
-			title       : 'some title',
-			description : 'this is a description',
-			tags        : ['something', 'fun'],
-			lang        : 'en',
-			renderer    : 'v3',
-			theme       : 'phb',
-			published   : true,
-			authors     : ['1', '2'],
-			owner       : '1',
-			thumbnail   : '',
-			_id         : 'mongoid',
-			editId      : 'abcdefg',
-			shareId     : 'hijklmnop',
-			views       : 1,
-			lastViewed  : new Date(),
-			version     : 1,
-			pageCount   : 1,
-			textBin     : '',
-			views       : 0
-		};
-		googleBrew = {
-			...hbBrew,
-			googleId : '12345'
-		};
+	beforeEach(async ()=>{
+		t = await createTestApp({ BREW_UPDATES: createFakeUpdates() });
 	});
 
-	describe('getId', ()=>{
-		it('should return only id if google id is not present', ()=>{
-			const { id, googleId } = api.getId({
-				params : {
-					id : 'abcdefgh'
-				}
-			});
+	afterEach(()=>t.close());
 
-			expect(id).toEqual('abcdefgh');
-			expect(googleId).toBeUndefined();
+	describe('POST /api (create)', ()=>{
+		it('creates a brew owned by the signed-in user, titled from its text', async ()=>{
+			const res = await t.send('POST', '/api', { body: { text: '# Dragon Lair\n\nA lair.', tags: ['monster'] }, as: 'alice' });
+			const brew = await res.json();
+
+			expect(res.status).toBe(200);
+			expect(brew).toMatchObject({ title: 'Dragon Lair', authors: ['alice'], tags: ['monster'], renderer: 'V3', version: 1 });
+			expect(brew.editId).toMatch(/^[\w-]{12}$/);
+			expect(brew.text).toContain('```metadata\ntitle: Dragon Lair');
 		});
 
-		it('should throw if id is too short', ()=>{
-			let err;
-			try {
-				api.getId({
-					params : {
-						id : 'abcd'
-					}
-				});
-			} catch (e) {
-				err = e;
-			};
+		it('creates anonymous brews without authors and ignores ids and counters from the client', async ()=>{
+			const brew = await createBrew({ text: 'Hi', editId: 'chosen000001', shareId: 'chosen000002', views: 99, version: 7, lock: { code: 1 } });
 
-			expect(err).toEqual({ HBErrorCode: '11', brewId: 'abcd', message: 'Invalid ID', name: 'ID Error', status: 404 });
+			expect(brew.authors).toEqual([]);
+			expect(brew.editId).not.toBe('chosen000001');
+			expect(brew).toMatchObject({ views: 0, version: 1 });
+			expect(brew.lock).toBeUndefined();
 		});
 
-		it('should return id and google id from request body', ()=>{
-			const { id, googleId } = api.getId({
-				params : {
-					id : 'abcdefghijkl'
-				},
-				body : {
-					googleId : '123456789012345678901234567890123'
-				}
-			});
-
-			expect(id).toEqual('abcdefghijkl');
-			expect(googleId).toEqual('123456789012345678901234567890123');
+		it('requires the current client version', async ()=>{
+			const res = await t.send('POST', '/api', { body: { text: 'x' }, headers: { 'Homebrewery-Version': '0.0.1' } });
+			expect(res.status).toBe(412);
 		});
 
-		it('should throw invalid - google id right length but does not match pattern', ()=>{
-			let err;
-			try {
-				api.getId({
-					params : {
-						id : 'abcdefghijkl'
-					},
-					body : {
-						googleId : '012345678901234567890123456789012'
-					}
-				});
-			} catch (e) {
-				err = e;
-			}
-
-			expect(err).toEqual({ HBErrorCode: '12', brewId: 'abcdefghijkl', message: 'Invalid ID', name: 'Google ID Error', status: 404 });
-		});
-
-		it('should throw invalid - google id too short (32 char)', ()=>{
-			let err;
-			try {
-				api.getId({
-					params : {
-						id : 'abcdefghijkl'
-					},
-					body : {
-						googleId : '12345678901234567890123456789012'
-					}
-				});
-			} catch (e) {
-				err = e;
-			}
-
-			expect(err).toEqual({ HBErrorCode: '12', brewId: 'abcdefghijkl', message: 'Invalid ID', name: 'Google ID Error', status: 404 });
-		});
-
-		it('should throw invalid - google id too long (45 char)', ()=>{
-			let err;
-			try {
-				api.getId({
-					params : {
-						id : 'abcdefghijkl'
-					},
-					body : {
-						googleId : '123456789012345678901234567890123456789012345'
-					}
-				});
-			} catch (e) {
-				err = e;
-			}
-
-			expect(err).toEqual({ HBErrorCode: '12', brewId: 'abcdefghijkl', message: 'Invalid ID', name: 'Google ID Error', status: 404 });
-		});
-
-		it('should return 12-char id and google id from params', ()=>{
-			const { id, googleId } = api.getId({
-				params : {
-					id : '123456789012345678901234567890123abcdefghijkl'
-				}
-			});
-
-			expect(googleId).toEqual('123456789012345678901234567890123');
-			expect(id).toEqual('abcdefghijkl');
-		});
-
-		it('should return 10-char id and google id from params', ()=>{
-			const { id, googleId } = api.getId({
-				params : {
-					id : '123456789012345678901234567890123abcdefghij'
-				}
-			});
-
-			expect(googleId).toEqual('123456789012345678901234567890123');
-			expect(id).toEqual('abcdefghij');
-		});
-	});
-	describe('getBrew', ()=>{
-		const toBrewPromise = (brew)=>new Promise((res)=>res({ toObject: ()=>brew }));
-		const notFoundError = { HBErrorCode: '05', message: 'Brew not found', name: 'BrewLoad Error', status: 404, accessType: 'share', brewId: '1' };
-
-		it('returns middleware', ()=>{
-			const getFn = api.getBrew('share');
-			expect(getFn).toBeInstanceOf(Function);
-		});
-
-		it('should fetch from mongoose', async ()=>{
-			const testBrew = { title: 'test brew', authors: [] };
-			api.getId = jest.fn(()=>({ id: '1', googleId: undefined }));
-			model.get = jest.fn(()=>toBrewPromise(testBrew));
-
-			const fn = api.getBrew('share', true);
-			const req = { brew: {} };
-			const next = jest.fn();
-			await fn(req, null, next);
-
-			expect(req.brew).toEqual(testBrew);
-			expect(next).toHaveBeenCalled();
-			expect(api.getId).toHaveBeenCalledWith(req);
-			expect(model.get).toHaveBeenCalledWith({ shareId: '1' });
-		});
-
-		it('should handle mongoose error', async ()=>{
-			api.getId = jest.fn(()=>({ id: '1', googleId: undefined }));
-			model.get = jest.fn(()=>new Promise((_, rej)=>rej('Unable to find brew')));
-
-			const fn = api.getBrew('share', false);
-			const req = { brew: {} };
-			const next = jest.fn();
-			let err;
-			try {
-				await fn(req, null, next);
-			} catch (e) {
-				err = e;
-			}
-
-			expect(err).toEqual(notFoundError);
-			expect(req.brew).toEqual({});
-			expect(next).not.toHaveBeenCalled();
-			expect(api.getId).toHaveBeenCalledWith(req);
-			expect(model.get).toHaveBeenCalledWith({ shareId: '1' });
-		});
-
-		it('changes tags from string to array', async ()=>{
-			const testBrew = { title: 'test brew', authors: [], tags: '' };
-			api.getId = jest.fn(()=>({ id: '1', googleId: undefined }));
-			model.get = jest.fn(()=>toBrewPromise(testBrew));
-
-			const fn = api.getBrew('share', true);
-			const req = { brew: {} };
-			const next = jest.fn();
-			await fn(req, null, next);
-
-			expect(req.brew.tags).toEqual([]);
-			expect(next).toHaveBeenCalled();
-		});
-
-		it('throws if not logged in as author', async ()=>{
-			api.getId = jest.fn(()=>({ id: '1', googleId: undefined }));
-			model.get = jest.fn(()=>toBrewPromise({ title: 'test brew', authors: ['a'] }));
-
-			const fn = api.getBrew('edit', true);
-			const req = { brew: {} };
-
-			let err;
-			try {
-				await fn(req, null, null);
-			} catch (e) {
-				err = e;
-			}
-
-			expect(err).toEqual({ HBErrorCode: '04', message: 'User is not logged in', name: 'Access Error', status: 401, brewTitle: 'test brew', authors: ['a'] });
-		});
-
-		it('throws if logged in as invalid author', async ()=>{
-			api.getId = jest.fn(()=>({ id: '1', googleId: undefined }));
-			model.get = jest.fn(()=>toBrewPromise({ title: 'test brew', authors: ['a'] }));
-
-			const fn = api.getBrew('edit', true);
-			const req = { brew: {}, account: { username: 'b' } };
-
-			let err;
-			try {
-				await fn(req, null, null);
-			} catch (e) {
-				err = e;
-			}
-
-			expect(err).toEqual({ HBErrorCode: '03', message: 'User is not an Author', name: 'Access Error', status: 401, brewTitle: 'test brew', authors: ['a'] });
-		});
-
-		it('does not throw if no authors', async ()=>{
-			api.getId = jest.fn(()=>({ id: '1', googleId: undefined }));
-			model.get = jest.fn(()=>toBrewPromise({ title: 'test brew', authors: [] }));
-
-			const fn = api.getBrew('edit', true);
-			const req = { brew: {} };
-			const next = jest.fn();
-			await fn(req, null, next);
-
-			expect(next).toHaveBeenCalled();
-			expect(req.brew.title).toEqual('test brew');
-			expect(req.brew.authors).toEqual([]);
-		});
-
-		it('does not throw if valid author', async ()=>{
-			api.getId = jest.fn(()=>({ id: '1', googleId: undefined }));
-			model.get = jest.fn(()=>toBrewPromise({ title: 'test brew', authors: ['a'] }));
-
-			const fn = api.getBrew('edit', true);
-			const req = { brew: {}, account: { username: 'a' } };
-			const next = jest.fn();
-			await fn(req, null, next);
-
-			expect(next).toHaveBeenCalled();
-			expect(req.brew.title).toEqual('test brew');
-			expect(req.brew.authors).toEqual(['a']);
-		});
-
-		it('fetches google brew if needed', async()=>{
-			const stubBrew = { title: 'test brew', authors: ['a'] };
-			const googleBrew = { title: 'test google brew', text: 'brew text' };
-			api.getId = jest.fn(()=>({ id: '1', googleId: '2' }));
-			model.get = jest.fn(()=>toBrewPromise(stubBrew));
-			google.getGoogleBrew = jest.fn(()=>new Promise((res)=>res(googleBrew)));
-
-			const fn = api.getBrew('share', false);
-			const req = { brew: {} };
-			const next = jest.fn();
-			await fn(req, null, next);
-
-			expect(req.brew).toEqual({
-				title       : 'test google brew',
-				authors     : ['a'],
-				text        : 'brew text',
-				stubbed     : true,
-				description : '',
-				editId      : undefined,
-				pageCount   : 1,
-				published   : false,
-				renderer    : 'legacy',
-				lang        : 'en',
-				shareId     : undefined,
-				tags        : [],
-				theme       : '5ePHB',
-				thumbnail   : '',
-				textBin     : undefined,
-				version     : undefined,
-				createdAt   : undefined,
-				gDrive      : false,
-				style       : undefined,
-				trashed     : false,
-				updatedAt   : undefined,
-				views       : 0,
-				bleedSize   : {
-					top    : '.125in',
-					bottom : '.125in',
-					inner  : '.125in',
-					outer  : '.125in',
-				},
-				columns      : '2',
-				columnGutter : '.125in',
-				legalAuthors : '',
-				license      : 'None',
-				safetySpace  : {
-					top    : '.25in',
-					bottom : '.25in',
-					outer  : '.25in',
-					inner  : '.5in',
-				},
-				trimSize : {
-					width  : '8.5in',
-					height : '11in',
-				},
-			});
-			expect(next).toHaveBeenCalled();
-			expect(api.getId).toHaveBeenCalledWith(req);
-			expect(model.get).toHaveBeenCalledWith({ shareId: '1' });
-			expect(google.getGoogleBrew).toHaveBeenCalledWith(undefined, '2', '1', 'share');
-		});
-
-		it('access is denied to a locked brew', async()=>{
-			const lockBrew = { title: 'test brew', shareId: '1', lock: { code: 404, shareMessage: 'brew locked' } };
-			model.get = jest.fn(()=>toBrewPromise(lockBrew));
-			api.getId = jest.fn(()=>({ id: '1', googleId: undefined }));
-
-			const fn = api.getBrew('share', false);
-			const req = { brew: {} };
-			const next = jest.fn();
-
-			await expect(fn(req, null, next)).rejects.toEqual({ 'HBErrorCode': '51', 'brewId': '1', 'brewTitle': 'test brew', 'code': 404, 'message': 'brew locked' });
-		});
-	});
-	describe('Get CSS', ()=>{
-		it('should return brew style content as CSS text', async ()=>{
-			const testBrew = { title: 'test brew', text: '```css\n\nI Have a style!\n```\n\n' };
-
-			const toBrewPromise = (brew)=>new Promise((res)=>res({ toObject: ()=>brew }));
-			api.getId = jest.fn(()=>({ id: '1', googleId: undefined }));
-			model.get = jest.fn(()=>toBrewPromise(testBrew));
-
-			const fn = api.getBrew('share', true);
-			const req = { brew: {} };
-			const next = jest.fn();
-			await fn(req, null, next);
-			await api.getCSS(req, res);
-
-			expect(req.brew).toEqual(testBrew);
-			expect(req.brew).toHaveProperty('style', '\nI Have a style!\n');
-			expect(res.status).toHaveBeenCalledWith(200);
-			expect(res.send).toHaveBeenCalledWith('\nI Have a style!\n');
-			expect(res.set).toHaveBeenCalledWith({
-				'Cache-Control' : 'no-cache',
-				'Content-Type'  : 'text/css'
-			});
-		});
-
-		it('should return 404 when brew has no style content', async ()=>{
-			const testBrew = { title: 'test brew', text: 'I don\'t have a style!' };
-
-			const toBrewPromise = (brew)=>new Promise((res)=>res({ toObject: ()=>brew }));
-			api.getId = jest.fn(()=>({ id: '1', googleId: undefined }));
-			model.get = jest.fn(()=>toBrewPromise(testBrew));
-
-			const fn = api.getBrew('share', true);
-			const req = { brew: {} };
-			const next = jest.fn();
-			await fn(req, null, next);
-			await api.getCSS(req, res);
-
-			expect(req.brew).toEqual(testBrew);
-			expect(req.brew).toHaveProperty('style');
-			expect(res.status).toHaveBeenCalledWith(404);
-			expect(res.send).toHaveBeenCalledWith('');
-		});
-
-		it('should return 404 when brew does not exist', async ()=>{
-			const testBrew = { };
-
-			const toBrewPromise = (brew)=>new Promise((res)=>res({ toObject: ()=>brew }));
-			api.getId = jest.fn(()=>({ id: '1', googleId: undefined }));
-			model.get = jest.fn(()=>toBrewPromise(testBrew));
-
-			const fn = api.getBrew('share', true);
-			const req = { brew: {} };
-			const next = jest.fn();
-			await fn(req, null, next);
-			await api.getCSS(req, res);
-
-			expect(req.brew).toEqual(testBrew);
-			expect(req.brew).toHaveProperty('style');
-			expect(res.status).toHaveBeenCalledWith(404);
-			expect(res.send).toHaveBeenCalledWith('');
-		});
-	});
-	describe('mergeBrewText', ()=>{
-		it('should set metadata and no style if it is not present', ()=>{
-			const result = api.mergeBrewText({
-				text        : `brew`,
-				title       : 'some title',
-				description : 'this is a description',
-				tags        : ['something', 'fun'],
-				renderer    : 'v3',
-				theme       : 'phb',
-				googleId    : '12345',
-				bleedSize   : {
-					top    : '.125in',
-					bottom : '.125in',
-					inner  : '.125in',
-					outer  : '.125in',
-				},
-				columns      : '2',
-				columnGutter : '.125in',
-				legalAuthors : '',
-				license      : 'None',
-				safetySpace  : {
-					top    : '.25in',
-					bottom : '.25in',
-					outer  : '.25in',
-					inner  : '.5in',
-				},
-				trimSize : {
-					width  : '8.5in',
-					height : '11in',
-				},
-			});
-
-			expect(result).toEqual(dedent`
-				\`\`\`metadata
-				title: some title
-				description: this is a description
-				tags:
-				  - something
-				  - fun
-				renderer: v3
-				theme: phb
-				columns: '2'
-				columnGutter: .125in
-				license: None
-				legalAuthors: ''
-				bleedSize:
-				  top: .125in
-				  bottom: .125in
-				  inner: .125in
-				  outer: .125in
-				safetySpace:
-				  top: .25in
-				  bottom: .25in
-				  outer: .25in
-				  inner: .5in
-				trimSize:
-				  width: 8.5in
-				  height: 11in
-				\`\`\`
-
-				brew`);
-		});
-
-		it('should set metadata and style', ()=>{
-			const result = api.mergeBrewText({
-				text        : `brew`,
-				style       : 'hello yes i am css',
-				title       : 'some title',
-				description : 'this is a description',
-				tags        : ['something', 'fun'],
-				renderer    : 'v3',
-				theme       : 'phb',
-				googleId    : '12345',
-				bleedSize   : {
-					top    : '.125in',
-					bottom : '.125in',
-					inner  : '.125in',
-					outer  : '.125in',
-				},
-				columns      : '2',
-				columnGutter : '.125in',
-				legalAuthors : '',
-				license      : 'None',
-				safetySpace  : {
-					top    : '.25in',
-					bottom : '.25in',
-					outer  : '.25in',
-					inner  : '.5in',
-				},
-				trimSize : {
-					width  : '8.5in',
-					height : '11in',
-				},
-			});
-
-			expect(result).toEqual(dedent`
-				\`\`\`metadata
-				title: some title
-				description: this is a description
-				tags:
-				  - something
-				  - fun
-				renderer: v3
-				theme: phb
-				columns: '2'
-				columnGutter: .125in
-				license: None
-				legalAuthors: ''
-				bleedSize:
-				  top: .125in
-				  bottom: .125in
-				  inner: .125in
-				  outer: .125in
-				safetySpace:
-				  top: .25in
-				  bottom: .25in
-				  outer: .25in
-				  inner: .5in
-				trimSize:
-				  width: 8.5in
-				  height: 11in
-				\`\`\`
-
-				\`\`\`css
-				hello yes i am css
-				\`\`\`
-
-				brew`);
-		});
-	});
-	describe('exclusion methods', ()=>{
-		it('excludePropsFromUpdate removes the correct keys', ()=>{
-			const sent = Object.assign({}, googleBrew);
-			const result = api.excludePropsFromUpdate(sent);
-
-			expect(sent).toEqual(googleBrew);
-			expect(result._id).toBeUndefined();
-			expect(result.views).toBeUndefined();
-			expect(result.lastViewed).toBeUndefined();
-		});
-
-		it('excludeGoogleProps removes the correct keys', ()=>{
-			const sent = Object.assign({}, googleBrew);
-			const result = api.excludeGoogleProps(sent);
-
-			expect(sent).toEqual(googleBrew);
-			expect(result.tags).toBeUndefined();
-			expect(result.published).toBeUndefined();
-			expect(result.authors).toBeUndefined();
-			expect(result.owner).toBeUndefined();
-			expect(result.views).toBeUndefined();
-			expect(result.thumbnail).toBeUndefined();
-			expect(result.version).toBeUndefined();
-		});
-
-		it('excludeStubProps removes the correct keys from the original object', ()=>{
-			const sent = Object.assign({}, googleBrew);
-			const result = api.excludeStubProps(sent);
-
-			expect(sent).not.toEqual(googleBrew);
-			expect(result.text).toBeUndefined();
-			expect(result.textBin).toBeUndefined();
-			expect(result.renderer).toBe('v3');
-			expect(result.pageCount).toBe(1);
-		});
-	});
-	describe('beforeNewSave', ()=>{
-		it('sets the title if none', ()=>{
-			const brew = {
-				...hbBrew,
-				title : undefined
-			};
-			api.beforeNewSave({}, brew);
-
-			expect(brew.title).toEqual('brew text');
-		});
-
-		it('does not override the title if present', ()=>{
-			const brew = {
-				...hbBrew,
-				title : 'test'
-			};
-			api.beforeNewSave({}, brew);
-
-			expect(brew.title).toEqual('test');
-		});
-
-		it('does not set authors if account missing username', ()=>{
-			api.beforeNewSave({}, hbBrew);
-
-			expect(hbBrew.authors).toEqual([]);
-		});
-
-		it('sets authors if account has username', ()=>{
-			api.beforeNewSave({ username: 'hi' }, hbBrew);
-
-			expect(hbBrew.authors).toEqual(['hi']);
-		});
-
-		it('merges brew text', ()=>{
-			api.mergeBrewText = jest.fn(()=>'merged');
-			api.beforeNewSave({}, hbBrew);
-
-			expect(api.mergeBrewText).toHaveBeenCalled();
-			expect(hbBrew.text).toEqual('merged');
-		});
-	});
-	describe('newGoogleBrew', ()=>{
-		it('should call the correct methods', ()=>{
-			api.excludeGoogleProps = jest.fn(()=>'newBrew');
-
-			const acct = { username: 'test' };
-			const brew = { title: 'test title' };
-			api.newGoogleBrew(acct, brew, res);
-
-			expect(google.authCheck).toHaveBeenCalledWith(acct, res);
-			expect(api.excludeGoogleProps).toHaveBeenCalledWith(brew);
-			expect(google.newGoogleBrew).toHaveBeenCalledWith('client', 'newBrew');
-		});
-	});
-	describe('newBrew', ()=>{
-		it('should set up a default brew via Homebrew model', async ()=>{
-			await api.newBrew({ body: { text: 'asdf' }, query: {}, account: { username: 'test user' } }, res);
-
-			expect(res.status).toHaveBeenCalledWith(200);
-			expect(res.send).toHaveBeenCalledWith({
-				_id         : '1',
-				authors     : ['test user'],
-				createdAt   : undefined,
-				description : '',
-				editId      : expect.any(String),
-				gDrive      : false,
-				pageCount   : 1,
-				published   : false,
-				renderer    : 'V3',
-				lang        : 'en',
-				shareId     : expect.any(String),
-				style       : undefined,
-				tags        : [],
-				text        : '```metadata\n' +
-    							'title: asdf\n' +
-    							'bleedSize: {}\n' +
-    							'safetySpace: {}\n' +
-    							'trimSize: {}' +
-								'\n' +
-								'```\n' +
-								'\n' +
-    							'asdf',
-				theme       : '5ePHB',
-				thumbnail   : '',
-				title       : 'asdf',
-				trashed     : false,
-				updatedAt   : undefined,
-				views       : 0,
-				bleedSize   : {
-					top    : '.125in',
-					bottom : '.125in',
-					inner  : '.125in',
-					outer  : '.125in',
-				},
-				columns      : '2',
-				columnGutter : '.125in',
-				legalAuthors : '',
-				license      : 'None',
-				safetySpace  : {
-					top    : '.25in',
-					bottom : '.25in',
-					outer  : '.25in',
-					inner  : '.5in',
-				},
-				trimSize : {
-					width  : '8.5in',
-					height : '11in',
-				},
-			});
-		});
-
-		it('should remove edit/share/google ids', async ()=>{
-			await api.newBrew({ body: { editId: '1234', shareId: '1234', googleId: '1234', text: 'asdf', title: '' }, query: {} }, res);
-
-			expect(res.status).toHaveBeenCalledWith(200);
-			expect(res.send).toHaveBeenCalled();
-			const sent = res.send.mock.calls[0][0];
-			expect(sent.editId).not.toEqual('1234');
-			expect(sent.shareId).not.toEqual('1234');
-			expect(sent.googleId).toBeUndefined();
-		});
-
-		it('should handle mongo error', async ()=>{
-			saveFunc = jest.fn(async function() {
-				throw 'err';
-			});
-			model.mockImplementation((brew)=>modelBrew(brew));
-
-			let err;
-			try {
-				await api.newBrew({ body: { editId: '1234', shareId: '1234', googleId: '1234', text: 'asdf', title: '' }, query: {} }, res);
-			} catch (e) {
-				err = e;
-			}
-
-			expect(res.send).not.toHaveBeenCalled();
-			expect(err).not.toBeUndefined();
-		});
-
-		it('should save to google if requested', async()=>{
-			await api.newBrew({ body: { text: 'asdf', title: '' }, query: { saveToGoogle: true }, account: { username: 'test user' } }, res);
-
-			expect(google.newGoogleBrew).toHaveBeenCalled();
-			expect(res.status).toHaveBeenCalledWith(200);
-			expect(res.send).toHaveBeenCalledWith({
-				_id       : '1',
-				authors   : ['test user'],
-				bleedSize : {
-					top    : '.125in',
-					bottom : '.125in',
-					inner  : '.125in',
-					outer  : '.125in',
-				},
-				columns      : '2',
-				columnGutter : '.125in',
-				createdAt    : undefined,
-				description  : '',
-				editId       : expect.any(String),
-				gDrive       : false,
-				pageCount    : 1,
-				published    : false,
-				renderer     : 'V3',
-				lang         : 'en',
-				shareId      : expect.any(String),
-				legalAuthors : '',
-				license      : 'None',
-				safetySpace  : {
-					top    : '.25in',
-					bottom : '.25in',
-					outer  : '.25in',
-					inner  : '.5in',
-				},
-				googleId  : expect.any(String),
-				style     : undefined,
-				tags      : [],
-				text      : undefined,
-				textBin   : undefined,
-				theme     : '5ePHB',
-				thumbnail : '',
-				title     : 'asdf',
-				trashed   : false,
-				trimSize  : {
-					width  : '8.5in',
-					height : '11in',
-				},
-				updatedAt : undefined,
-				views     : 0
-			});
-		});
-	});
-	describe('Theme bundle', ()=>{
-		it('should return Theme Bundle for a User Theme', async ()=>{
-			const brews = {
-				userThemeAID : { title: 'User Theme A', renderer: 'V3', theme: null, shareId: 'userThemeAID', style: 'User Theme A Style', tags: ['meta:theme'], authors: ['authorName'] }
-			};
-
-			const toBrewPromise = (brew)=>new Promise((res)=>res({ toObject: ()=>brew }));
-			model.get = jest.fn((getParams)=>toBrewPromise(brews[getParams.shareId]));
-			const req = { params: { renderer: 'V3', id: 'userThemeAID' }, get: ()=>{ return 'localhost'; }, protocol: 'https' };
-
-			await api.getThemeBundle(req, res);
-
-			expect(res.status).toHaveBeenCalledWith(200);
-			expect(res.send).toHaveBeenCalledWith({
-				name     : 'User Theme A',
-				author   : 'authorName',
-				styles   : ['/* From Brew: https://localhost/share/userThemeAID */\n\nUser Theme A Style'],
-				snippets : []
-			});
-		});
-
-		it('should return Theme Bundle for nested User Themes', async ()=>{
-			const brews = {
-				userThemeAID : { title: 'User Theme A', renderer: 'V3', theme: 'userThemeBID', shareId: 'userThemeAID', style: 'User Theme A Style', tags: ['meta:theme'], authors: ['authorName'] },
-				userThemeBID : { title: 'User Theme B', renderer: 'V3', theme: 'userThemeCID', shareId: 'userThemeBID', style: 'User Theme B Style', tags: ['meta:theme'], authors: ['authorName'] },
-				userThemeCID : { title: 'User Theme C', renderer: 'V3', theme: null, shareId: 'userThemeCID', style: 'User Theme C Style', tags: ['meta:theme'], authors: ['authorName'] }
-			};
-
-			const toBrewPromise = (brew)=>new Promise((res)=>res({ toObject: ()=>brew }));
-			model.get = jest.fn((getParams)=>toBrewPromise(brews[getParams.shareId]));
-			const req = { params: { renderer: 'V3', id: 'userThemeAID' }, get: ()=>{ return 'localhost'; }, protocol: 'https' };
-
-			await api.getThemeBundle(req, res);
-
-			expect(res.status).toHaveBeenCalledWith(200);
-			expect(res.send).toHaveBeenCalledWith({
-				name   : 'User Theme A',
-				author : 'authorName',
-				styles : [
-					'/* From Brew: https://localhost/share/userThemeCID */\n\nUser Theme C Style',
-					'/* From Brew: https://localhost/share/userThemeBID */\n\nUser Theme B Style',
-					'/* From Brew: https://localhost/share/userThemeAID */\n\nUser Theme A Style'
-				],
-				snippets : []
-			});
-		});
-
-		it('should return Theme Bundle for a Static Theme', async ()=>{
-			const req = { params: { renderer: 'V3', id: '5ePHB' }, get: ()=>{ return 'localhost'; }, protocol: 'https' };
-
-			await api.getThemeBundle(req, res);
-
-			expect(res.status).toHaveBeenCalledWith(200);
-			expect(res.send).toHaveBeenCalledWith({
-				name   : '5ePHB',
-				author : undefined,
-				styles : [
-					`/* From Theme Blank */\n\n@import url("/themes/V3/Blank/style.css");`,
-					`/* From Theme 5ePHB */\n\n@import url("/themes/V3/5ePHB/style.css");`
-				],
-				snippets : [
-					'V3_Blank',
-					'V3_5ePHB'
-				]
-			});
-		});
-
-		it('should return Theme Bundle for nested User and Static Themes together', async ()=>{
-			const brews = {
-				userThemeAID : { title: 'User Theme A', renderer: 'V3', theme: 'userThemeBID', shareId: 'userThemeAID', style: 'User Theme A Style', tags: ['meta:theme'], authors: ['authorName'] },
-				userThemeBID : { title: 'User Theme B', renderer: 'V3', theme: 'userThemeCID', shareId: 'userThemeBID', style: 'User Theme B Style', tags: ['meta:theme'], authors: ['authorName'] },
-				userThemeCID : { title: 'User Theme C', renderer: 'V3', theme: '5eDMG', shareId: 'userThemeCID', style: 'User Theme C Style', tags: ['meta:theme'], authors: ['authorName'] }
-			};
-
-			const toBrewPromise = (brew)=>new Promise((res)=>res({ toObject: ()=>brew }));
-			model.get = jest.fn((getParams)=>toBrewPromise(brews[getParams.shareId]));
-			const req = { params: { renderer: 'V3', id: 'userThemeAID' }, get: ()=>{ return 'localhost'; }, protocol: 'https' };
-
-			await api.getThemeBundle(req, res);
-
-			expect(res.status).toHaveBeenCalledWith(200);
-			expect(res.send).toHaveBeenCalledWith({
-				name   : 'User Theme A',
-				author : 'authorName',
-				styles : [
-					`/* From Theme Blank */\n\n@import url("/themes/V3/Blank/style.css");`,
-					`/* From Theme 5ePHB */\n\n@import url("/themes/V3/5ePHB/style.css");`,
-					`/* From Theme 5eDMG */\n\n@import url("/themes/V3/5eDMG/style.css");`,
-					'/* From Brew: https://localhost/share/userThemeCID */\n\nUser Theme C Style',
-					'/* From Brew: https://localhost/share/userThemeBID */\n\nUser Theme B Style',
-					'/* From Brew: https://localhost/share/userThemeAID */\n\nUser Theme A Style'
-				],
-				snippets : [
-					'V3_Blank',
-					'V3_5ePHB',
-					'V3_5eDMG'
-				]
-			});
-		});
-
-		it('should fail for a missing Theme in the chain', async()=>{
-			const brews = {
-				userThemeAID : { title: 'User Theme A', renderer: 'V3', theme: 'missingTheme', shareId: 'userThemeAID', style: 'User Theme A Style', tags: ['meta:theme'], authors: ['authorName'] },
-			};
-
-			const toBrewPromise = (brew)=>new Promise((res)=>res({ toObject: ()=>brew }));
-			model.get = jest.fn((getParams)=>toBrewPromise(brews[getParams.shareId]));
-			const req = { params: { renderer: 'V3', id: 'userThemeAID' }, get: ()=>{ return 'localhost'; }, protocol: 'https' };
-
-			let err;
-			await api.getThemeBundle(req, res)
-			.catch((e)=>err = e);
-
-			expect(err).toEqual({
-				HBErrorCode : '09',
-				accessType  : 'share',
-				brewId      : 'missingTheme',
-				message     : 'Theme Not Found',
-				name        : 'ThemeLoad Error',
-				status      : 404 });
-		});
-
-		it('should fail for a User Theme not tagged with meta:theme', async ()=>{
-			const brews = {
-				userThemeAID : { title: 'User Theme A', renderer: 'V3', theme: null, shareId: 'userThemeAID', style: 'User Theme A Style' }
-			};
-
-			const toBrewPromise = (brew)=>new Promise((res)=>res({ toObject: ()=>brew }));
-			model.get = jest.fn((getParams)=>toBrewPromise(brews[getParams.shareId]));
-			const req = { params: { renderer: 'V3', id: 'userThemeAID' }, get: ()=>{ return 'localhost'; }, protocol: 'https' };
-
-			let err;
-			await api.getThemeBundle(req, res)
-			.catch((e)=>err = e);
-
-			expect(err).toEqual({
-				HBErrorCode : '10',
-				brewId      : 'userThemeAID',
-				message     : 'Selected theme does not have the meta:theme tag',
-				name        : 'Invalid Theme Selected',
-				status      : 422 });
-		});
-	});
-	describe('updateBrew', ()=>{
-		it('should return error on version mismatch', async ()=>{
-			const brewFromClient = { version: 1 };
-			const brewFromServer = { version: 1000, text: '' };
-
-			const req = {
-				brew : brewFromServer,
-				body : brewFromClient
-			};
-
-			await api.updateBrew(req, res);
-
-			expect(res.status).toHaveBeenCalledWith(409);
-			expect(res.send).toHaveBeenCalledWith('{\"message\":\"The server version is out of sync with the saved brew. Please save your changes elsewhere, refresh, and try again.\"}');
-		});
-
-		it('should return error on hash mismatch', async ()=>{
-			const brewFromClient = { version: 1, hash: '1234' };
-			const brewFromServer = { version: 1, text: 'test' };
-
-			const req = {
-				brew : brewFromServer,
-				body : brewFromClient
-			};
-
-			await api.updateBrew(req, res);
-
-			expect(req.brew.hash).toBe('098f6bcd4621d373cade4e832627b4f6');
-			expect(res.status).toHaveBeenCalledWith(409);
-			expect(res.send).toHaveBeenCalledWith('{\"message\":\"The server copy is out of sync with the saved brew. Please save your changes elsewhere, refresh, and try again.\"}');
-		});
-
-		// Commenting this one out for now, since we are no longer throwing this error while we monitor
-		// it('should return error on applying patches', async ()=>{
-		// 	const brewFromClient = { version: 1, hash: '098f6bcd4621d373cade4e832627b4f6', patches: 'not a valid patch string' };
-		// 	const brewFromServer = { version: 1, text: 'test', title: 'Test Title', description: 'Test Description' };
-
-		// 	const req = {
-		// 		brew  : brewFromServer,
-		// 		body  : brewFromClient,
-		// 	};
-
-		// 	let err;
-		// 	try {
-		// 		await api.updateBrew(req, res);
-		// 	} catch (e) {
-		// 		err = e;
-		// 	}
-
-		// 	expect(err).toEqual(Error('Invalid patch string: not a valid patch string'));
-		// });
-
-		it('should save brew, no ID', async ()=>{
-			const brewFromClient = { version: 1, hash: '098f6bcd4621d373cade4e832627b4f6', patches: '' };
-			const brewFromServer = { version: 1, text: 'test', title: 'Test Title', description: 'Test Description' };
-
-			model.save = jest.fn((brew)=>{return brew;});
-
-			const req = {
-				brew  : brewFromServer,
-				body  : brewFromClient,
-				query : { saveToGoogle: false, removeFromGoogle: false }
-			};
-
-			await api.updateBrew(req, res);
-
-			expect(res.status).toHaveBeenCalledWith(200);
-			expect(res.send).toHaveBeenCalledWith(
-				expect.objectContaining({
-					_id         : '1',
-					description : 'Test Description',
-					hash        : '098f6bcd4621d373cade4e832627b4f6',
-					title       : 'Test Title',
-					version     : 2
-				})
-			);
+		it('rejects bodies that are not a JSON object', async ()=>{
+			const invalid = await t.send('POST', '/api', { body: strToU8('not json'), headers: { 'Content-Type': 'application/json' } });
+			const notAnObject = await t.send('POST', '/api', { body: 'a string' });
+			expect(invalid.status).toBe(400);
+			expect(notAnObject.status).toBe(400);
 		});
 	});
 
-	describe('deleteGoogleBrew', ()=>{
-		it('should check auth and delete brew', async ()=>{
-			const result = await api.deleteGoogleBrew({ username: 'test user' }, 'id', 'editId', res);
-
-			expect(result).toBe(true);
-			expect(google.authCheck).toHaveBeenCalledWith({ username: 'test user' }, expect.objectContaining({}));
-			expect(google.deleteGoogleBrew).toHaveBeenCalledWith('client', 'id', 'editId');
-		});
-	});
-	describe('deleteBrew', ()=>{
-		it('should handle case where fetching the brew returns an error', async ()=>{
-			api.getBrew = jest.fn(()=>async ()=>{ throw { message: 'err', HBErrorCode: '02' }; });
-			api.getId = jest.fn(()=>({ id: '1', googleId: '2' }));
-			model.deleteOne = jest.fn(async ()=>{});
-			const next = jest.fn(()=>{});
-
-			await api.deleteBrew(null, null, next);
-
-			expect(next).toHaveBeenCalled();
-			expect(model.deleteOne).toHaveBeenCalledWith({ editId: '1' });
+	describe('PUT /api/update/:id (save)', ()=>{
+		let brew;
+		beforeEach(async ()=>{
+			brew = await createBrew({ text: 'Original text', title: 'Saved' }, 'alice');
 		});
 
-		it('should delete if no authors', async ()=>{
-			const brew = {
-				...hbBrew,
-				authors : []
-			};
-			api.getBrew = jest.fn(()=>async (req)=>{
-				req.brew = brew;
-			});
-			model.findOne = jest.fn(async ()=>modelBrew(brew));
-			model.deleteOne = jest.fn(async ()=>{});
-			const req = {};
+		it('saves new text, bumps the version and notifies share pages', async ()=>{
+			const res = await saveBrew(brew.editId, { text: 'Changed text' }, { as: 'alice' });
+			const saved = await res.json();
 
-			await api.deleteBrew(req, res);
+			expect(res.status).toBe(200);
+			expect(saved).toMatchObject({ editId: brew.editId, shareId: brew.shareId, version: 2 });
+			expect(saved).not.toHaveProperty('text');
+			expect(t.env.BREW_UPDATES.broadcasts).toEqual([
+				{ id: brew.shareId, message: expect.objectContaining({ event: 'brewUpdated', shareId: brew.shareId, version: 2 }) }
+			]);
 
-			expect(api.getBrew).toHaveBeenCalled();
-			expect(model.findOne).toHaveBeenCalled();
-			expect(model.deleteOne).toHaveBeenCalled();
+			const fetched = await (await t.request(`/api/fetch/${brew.shareId}`)).json();
+			expect(fetched.brew.text).toBe('Changed text');
 		});
 
-		it('should throw on delete error', async ()=>{
-			const brew = {
-				...hbBrew,
-				authors : []
-			};
-			api.getBrew = jest.fn(()=>async (req)=>{
-				req.brew = brew;
-			});
-			model.findOne = jest.fn(async ()=>modelBrew(brew));
-			model.deleteOne = jest.fn(async ()=>{ throw 'err'; });
-			const req = {};
+		it('accepts gzip-compressed bodies like the editor sends', async ()=>{
+			const current = await editorCopy(brew.editId);
+			const body = gzipSync(strToU8(JSON.stringify({ ...current, text: 'Zipped', hash: await sha256(current.text), version: 1 })));
 
-			let err;
-			try {
-				await api.deleteBrew(req, res);
-			} catch (e) {
-				err = e;
-			}
+			const res = await t.send('PUT', `/api/update/${brew.editId}`, { body, as: 'alice', headers: { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' } });
 
-			expect(err).not.toBeUndefined();
-			expect(api.getBrew).toHaveBeenCalled();
-			expect(model.findOne).toHaveBeenCalled();
-			expect(model.deleteOne).toHaveBeenCalled();
+			expect(res.status).toBe(200);
+			expect((await (await t.request(`/api/fetch/${brew.shareId}`)).json()).brew.text).toBe('Zipped');
 		});
 
-		it('should delete when one author', async ()=>{
-			const brew = {
-				...hbBrew,
-				authors : ['test']
-			};
-			api.getBrew = jest.fn(()=>async (req)=>{
-				req.brew = brew;
-			});
-			model.findOne = jest.fn(async ()=>modelBrew(brew));
-			model.deleteOne = jest.fn(async ()=>{});
-			const req = { account: { username: 'test' } };
+		it('rejects a save based on an older version', async ()=>{
+			await saveBrew(brew.editId, { text: 'First' }, { as: 'alice' });
+			const res = await saveBrew(brew.editId, { text: 'Second', version: 1 }, { as: 'alice' });
 
-			await api.deleteBrew(req, res);
-
-			expect(api.getBrew).toHaveBeenCalled();
-			expect(model.findOne).toHaveBeenCalled();
-			expect(model.deleteOne).toHaveBeenCalled();
+			expect(res.status).toBe(409);
+			expect((await res.json()).message).toMatch(/version is out of sync/);
 		});
 
-		it('should remove one author when multiple present', async ()=>{
-			const brew = {
-				...hbBrew,
-				authors : ['test', 'test2']
-			};
-			api.getBrew = jest.fn(()=>async (req)=>{
-				req.brew = brew;
-			});
-			model.findOne = jest.fn(async ()=>modelBrew(brew));
-			model.deleteOne = jest.fn(async ()=>{});
-			const req = { account: { username: 'test' } };
-
-			await api.deleteBrew(req, res);
-
-			expect(api.getBrew).toHaveBeenCalled();
-			expect(markModifiedFunc).toHaveBeenCalled();
-			expect(model.findOne).toHaveBeenCalled();
-			expect(model.deleteOne).not.toHaveBeenCalled();
-			expect(saveFunc).toHaveBeenCalled();
-			expect(saved.authors).toEqual(['test2']);
+		it('rejects a save whose hash does not match the stored text', async ()=>{
+			const res = await saveBrew(brew.editId, { text: 'x', hash: 'not-the-hash' }, { as: 'alice' });
+			expect(res.status).toBe(409);
+			expect((await res.json()).message).toMatch(/copy is out of sync/);
 		});
 
-		it('should handle save error', async ()=>{
-			const brew = {
-				...hbBrew,
-				authors : ['test', 'test2']
-			};
-			api.getBrew = jest.fn(()=>async (req)=>{
-				req.brew = brew;
-			});
-			model.findOne = jest.fn(async ()=>modelBrew(brew));
-			model.deleteOne = jest.fn(async ()=>{});
-			saveFunc = jest.fn(async ()=>{ throw 'err'; });
-			const req = { account: { username: 'test' } };
+		it('ignores protected fields sent by the client', async ()=>{
+			await t.db.prepare(`UPDATE brews SET lock = '{"code":455}', views = 5 WHERE edit_id = ?`).bind(brew.editId).run();
+			await saveBrew(brew.editId, { text: 'x', lock: null, views: 0, shareId: 'stolen000001' }, { as: 'alice' });
 
-			let err;
-			try {
-				await api.deleteBrew(req, res);
-			} catch (e) {
-				err = e;
-			}
-
-			expect(err).not.toBeUndefined();
-			expect(api.getBrew).toHaveBeenCalled();
-			expect(model.findOne).toHaveBeenCalled();
-			expect(model.deleteOne).not.toHaveBeenCalled();
-			expect(saveFunc).toHaveBeenCalled();
+			expect(await storedBrew(brew.editId)).toMatchObject({ lock: '{"code":455}', views: 5, share_id: brew.shareId });
 		});
 
-		it('should delete google brew', async ()=>{
-			const brew = {
-				...googleBrew,
-				authors : ['test']
-			};
-			api.getBrew = jest.fn(()=>async (req)=>{
-				req.brew = brew;
-			});
-			model.findOne = jest.fn(async ()=>modelBrew(brew));
-			model.deleteOne = jest.fn(async ()=>{});
-			api.deleteGoogleBrew = jest.fn(async ()=>true);
-			const req = { account: { username: 'test' } };
+		it('adds an invited author who saves to the authors', async ()=>{
+			await t.db.prepare(`UPDATE brews SET invited_authors = '["bob"]' WHERE edit_id = ?`).bind(brew.editId).run();
+			const res = await saveBrew(brew.editId, { text: 'Bob was here' }, { as: 'bob' });
 
-			await api.deleteBrew(req, res);
-
-			expect(api.getBrew).toHaveBeenCalled();
-			expect(model.findOne).toHaveBeenCalled();
-			expect(model.deleteOne).toHaveBeenCalled();
-			expect(api.deleteGoogleBrew).toHaveBeenCalled();
+			expect(await res.json()).toMatchObject({ authors: ['alice', 'bob'], invitedAuthors: [] });
 		});
 
-		it('should handle google brew delete error', async ()=>{
-			const brew = {
-				...googleBrew,
-				authors : ['test']
-			};
-			api.getBrew = jest.fn(()=>async (req)=>{
-				req.brew = brew;
-			});
-			model.findOne = jest.fn(async ()=>modelBrew(brew));
-			model.deleteOne = jest.fn(async ()=>{});
-			api.deleteGoogleBrew = jest.fn(async ()=>{
-				 throw 'err';
-			});
-			const req = { account: { username: 'test' } };
-
-			await api.deleteBrew(req, res);
-
-			expect(api.getBrew).toHaveBeenCalled();
-			expect(model.findOne).toHaveBeenCalled();
-			expect(model.deleteOne).toHaveBeenCalled();
-			expect(api.deleteGoogleBrew).toHaveBeenCalled();
+		it('refuses users who are not authors', async ()=>{
+			const res = await saveBrew(brew.editId, { text: 'x' }, { as: 'mallory' });
+			expect(res.status).toBe(401);
+			expect(await res.json()).toMatchObject({ HBErrorCode: '03' });
 		});
 
-		it('should delete google brew and retain stub when multiple authors and owner request deletion', async ()=>{
-			const brew = {
-				...googleBrew,
-				authors : ['test', 'test2']
-			};
-			api.getBrew = jest.fn(()=>async (req)=>{
-				req.brew = brew;
-			});
-			model.findOne = jest.fn(async ()=>modelBrew(brew));
-			model.deleteOne = jest.fn(async ()=>{});
-			api.deleteGoogleBrew = jest.fn(async ()=>true);
-			const req = { account: { username: 'test' } };
-
-			await api.deleteBrew(req, res);
-
-			expect(api.getBrew).toHaveBeenCalled();
-			expect(markModifiedFunc).toHaveBeenCalled();
-			expect(model.findOne).toHaveBeenCalled();
-			expect(model.deleteOne).not.toHaveBeenCalled();
-			expect(api.deleteGoogleBrew).toHaveBeenCalled();
-			expect(saveFunc).toHaveBeenCalled();
-			expect(saved.authors).toEqual(['test2']);
-			expect(saved.googleId).toEqual(undefined);
-			expect(saved.text).not.toEqual(undefined);
+		it('refuses anonymous saves of an authored brew', async ()=>{
+			const res = await saveBrew(brew.editId, { text: 'x' });
+			expect(res.status).toBe(401);
+			expect(await res.json()).toMatchObject({ HBErrorCode: '04' });
 		});
 
-		it('should retain google brew and update stub when multiple authors and extra author requests deletion', async ()=>{
-			const brew = {
-				...googleBrew,
-				authors : ['test', 'test2']
-			};
-			api.getBrew = jest.fn(()=>async (req)=>{
-				req.brew = brew;
-			});
-			model.findOne = jest.fn(async ()=>modelBrew(brew));
-			model.deleteOne = jest.fn(async ()=>{});
-			api.deleteGoogleBrew = jest.fn(async ()=>true);
-			const req = { account: { username: 'test2' } };
-
-			await api.deleteBrew(req, res);
-
-			expect(api.getBrew).toHaveBeenCalled();
-			expect(model.findOne).toHaveBeenCalled();
-			expect(model.deleteOne).not.toHaveBeenCalled();
-			expect(api.deleteGoogleBrew).not.toHaveBeenCalled();
-			expect(saveFunc).toHaveBeenCalled();
-			expect(saved.authors).toEqual(['test']);
-			expect(saved.googleId).toEqual(brew.googleId);
+		it('rejects text too large for D1 with error 14', async ()=>{
+			const huge = Array.from({ length: 400_000 }, ()=>Math.random().toString(36).slice(2)).join('');
+			const res = await saveBrew(brew.editId, { text: huge }, { as: 'alice' });
+			expect(res.status).toBe(413);
+			expect(await res.json()).toMatchObject({ HBErrorCode: '14' });
 		});
 	});
 
-	describe('Split Text, Style, and Metadata', ()=>{
+	describe('DELETE /api/:id', ()=>{
+		it('deletes a brew whose only author removes it', async ()=>{
+			const brew = await createBrew({ text: 'Mine' }, 'alice');
 
-		it('basic splitting', async ()=>{
-			const testBrew = {
-				text : '```metadata\n' +
-					'title: title\n' +
-					'description: description\n' +
-					'tags: [ \'tag a\' , \'tag b\' ]\n' +
-					'renderer: legacy\n' +
-					'theme: 5ePHB\n' +
-					'lang: en\n' +
-					'\n' +
-					'```\n' +
-					'\n' +
-					'```css\n' +
-					'style\n' +
-					'style\n' +
-					'style\n' +
-					'```\n' +
-					'\n' +
-					'text\n'
-			};
-
-			splitTextStyleAndMetadata(testBrew);
-
-			// Metadata
-			expect(testBrew.title).toEqual('title');
-			expect(testBrew.description).toEqual('description');
-			expect(testBrew.renderer).toEqual('legacy');
-			expect(testBrew.theme).toEqual('5ePHB');
-			expect(testBrew.lang).toEqual('en');
-			// Style
-			expect(testBrew.style).toEqual('style\nstyle\nstyle\n');
-			// Text
-			expect(testBrew.text).toEqual('text\n');
+			expect((await t.send('DELETE', `/api/${brew.editId}`, { as: 'alice' })).status).toBe(204);
+			expect(await storedBrew(brew.editId)).toBeNull();
 		});
 
-		it('extended metadata', async ()=>{
-			const testBrew = {
-				text : '```metadata\n' +
-					'title: title\n' +
-					'description: description\n' +
-					'tags: [ \'tag a\' , \'tag b\' ]\n' +
-					'renderer: legacy\n' +
-					'theme: 5ePHB\n' +
-					'lang: en\n' +
-					'bleedSize:\n' +
-					'  top: 1.5in\n' +
-					'  bottom: 1.5in\n' +
-					'  outer: 1.5in\n' +
-					'  inner: 1.5in\n' +
-					'safetySpace:\n' +
-					'  top: 1.25in\n' +
-					'  bottom: 1.25in\n' +
-					'  outer: 1.25in\n' +
-					'  inner: 1.5in\n' +
-					'trimSize:\n' +
-					'  width: 18.5in\n' +
-					'  height: 111in\n' +
-					'columns: 12\n' +
-					'columnGutter: 1.125in\n' +
-					'license: AELF\n' +
-					'legalAuthors: Tom Bombadil\n' +
-					'\n' +
-					'```\n' +
-					'\n' +
-					'```css\n' +
-					'style\n' +
-					'style\n' +
-					'style\n' +
-					'```\n' +
-					'\n' +
-					'text\n'
-			};
+		it('only removes the user when other authors remain', async ()=>{
+			const brew = await createBrew({ text: 'Shared' }, 'alice');
+			await t.db.prepare(`INSERT INTO brew_authors (brew_id, position, username) SELECT id, 1, 'bob' FROM brews WHERE edit_id = ?`).bind(brew.editId).run();
 
-			splitTextStyleAndMetadata(testBrew);
+			expect((await t.send('DELETE', `/api/${brew.editId}`, { as: 'bob' })).status).toBe(204);
+			expect((await (await t.request(`/metadata/${brew.shareId}`)).json()).authors).toEqual(['alice']);
+		});
 
-			// Metadata
-			expect(testBrew.title).toEqual('title');
-			expect(testBrew.description).toEqual('description');
-			expect(testBrew.renderer).toEqual('legacy');
-			expect(testBrew.theme).toEqual('5ePHB');
-			expect(testBrew.lang).toEqual('en');
-			// Paper Specfications
-			expect(testBrew.bleedSize.top).toEqual('1.5in');
-			expect(testBrew.bleedSize.bottom).toEqual('1.5in');
-			expect(testBrew.bleedSize.inner).toEqual('1.5in');
-			expect(testBrew.bleedSize.outer).toEqual('1.5in');
+		it('deletes anonymous brews for anyone with the edit id', async ()=>{
+			const brew = await createBrew({ text: 'Anon' });
+			expect((await t.send('DELETE', `/api/${brew.editId}`)).status).toBe(204);
+		});
 
-			expect(testBrew.safetySpace.top).toEqual('1.25in');
-			expect(testBrew.safetySpace.bottom).toEqual('1.25in');
-			expect(testBrew.safetySpace.inner).toEqual('1.5in');
-			expect(testBrew.safetySpace.outer).toEqual('1.25in');
-
-			expect(testBrew.trimSize.width).toEqual('18.5in');
-			expect(testBrew.trimSize.height).toEqual('111in');
-
-			expect(testBrew.columns).toEqual(12);
-			expect(testBrew.columnGutter).toEqual('1.125in');
-
-			// Extended Metadata
-			expect(testBrew.license).toEqual('AELF');
-			expect(testBrew.legalAuthors).toEqual('Tom Bombadil');
-
-			// Style
-			expect(testBrew.style).toEqual('style\nstyle\nstyle\n');
-			// Text
-			expect(testBrew.text).toEqual('text\n');
+		it('refuses non-authors', async ()=>{
+			const brew = await createBrew({ text: 'Mine' }, 'alice');
+			expect((await t.send('DELETE', `/api/${brew.editId}`, { as: 'mallory' })).status).toBe(401);
 		});
 	});
 
+	describe('read-only endpoints', ()=>{
+		let brew;
+		beforeEach(async ()=>{
+			brew = await createBrew({ text: 'Hello <b>&</b>', style: '.page { color: red; }', title: 'Hello: World?' }, 'alice');
+		});
+
+		it('fetches a brew by share id without its edit id, unless the author asks', async ()=>{
+			const anonymous = (await (await t.request(`/api/fetch/${brew.shareId}`)).json()).brew;
+			const author = (await (await t.send('GET', `/api/fetch/${brew.shareId}`, { as: 'alice' })).json()).brew;
+
+			expect(anonymous).toMatchObject({ shareId: brew.shareId, text: 'Hello <b>&</b>', style: '.page { color: red; }\n' });
+			expect(anonymous.editId).toBeUndefined();
+			expect(author.editId).toBe(brew.editId);
+		});
+
+		it('serves metadata, css, escaped source and a download', async ()=>{
+			expect(await (await t.request(`/metadata/${brew.shareId}`)).json()).toMatchObject({ title: 'Hello: World?', authors: ['alice'], shareId: brew.shareId });
+
+			const css = await t.request(`/css/${brew.shareId}`);
+			expect(css.headers.get('Content-Type')).toBe('text/css');
+			expect(await css.text()).toBe('.page { color: red; }\n');
+
+			expect(await (await t.request(`/source/${brew.shareId}`)).text()).toContain('Hello &lt;b&gt;&amp;&lt;/b&gt;');
+
+			const download = await t.request(`/download/${brew.shareId}`);
+			expect(download.headers.get('Content-Disposition')).toBe(`attachment; filename*=UTF-8''HB-HelloWorld.txt`);
+			expect(await download.text()).toBe('Hello <b>&</b>');
+		});
+
+		it('answers 404 for a brew without style and for unknown or malformed ids', async ()=>{
+			const plain = await createBrew({ text: 'No style' });
+			expect((await t.request(`/css/${plain.shareId}`)).status).toBe(404);
+			expect(await (await t.request('/api/fetch/unknown00001')).json()).toMatchObject({ HBErrorCode: '05' });
+			expect(await (await t.request('/api/fetch/bad!id')).json()).toMatchObject({ HBErrorCode: '11' });
+		});
+
+		it('refuses to share a locked brew', async ()=>{
+			await t.db.prepare(`UPDATE brews SET lock = '{"code":455,"shareMessage":"Locked"}' WHERE edit_id = ?`).bind(brew.editId).run();
+			const res = await t.request(`/api/fetch/${brew.shareId}`);
+			expect(res.status).toBe(455);
+			expect(await res.json()).toMatchObject({ HBErrorCode: '51', message: 'Locked' });
+		});
+	});
+
+	describe('GET /api/theme/:renderer/:id', ()=>{
+		it('returns a static theme with its parents, oldest first', async ()=>{
+			const bundle = await (await t.request('/api/theme/V3/5eDMG')).json();
+
+			expect(bundle.name).toBe('5eDMG');
+			expect(bundle.snippets).toEqual(['V3_Blank', 'V3_5ePHB', 'V3_5eDMG']);
+			expect(bundle.styles.map((style)=>style.split('\n')[0])).toEqual(['/* From Theme Blank */', '/* From Theme 5ePHB */', '/* From Theme 5eDMG */']);
+		});
+
+		it('chains user themes onto static themes', async ()=>{
+			const base = await createBrew({ text: 'x', title: 'Base Theme', style: '.base{}', tags: ['meta:theme'], theme: '5ePHB' }, 'alice');
+			const child = await createBrew({ text: 'x', title: 'Child Theme', style: '.child{}', tags: ['meta:theme'], theme: base.shareId }, 'alice');
+
+			const bundle = await (await t.request(`/api/theme/V3/${child.shareId}`)).json();
+
+			expect(bundle).toMatchObject({ name: 'Child Theme', author: 'alice' });
+			expect(bundle.styles.at(-1)).toContain('.child{}');
+			expect(bundle.styles.at(-2)).toContain('.base{}');
+			expect(bundle.snippets.slice(0, 2)).toEqual(['V3_Blank', 'V3_5ePHB']);
+		});
+
+		it('fails for missing themes and brews without the meta:theme tag', async ()=>{
+			const notATheme = await createBrew({ text: 'x', title: 'Plain' });
+
+			expect(await (await t.request('/api/theme/V3/missing0001a')).json()).toMatchObject({ HBErrorCode: '09' });
+			const res = await t.request(`/api/theme/V3/${notATheme.shareId}`);
+			expect(res.status).toBe(422);
+			expect(await res.json()).toMatchObject({ HBErrorCode: '10' });
+		});
+	});
+
+	describe('PUT /api/user/rename', ()=>{
+		it('renames the signed-in user on their brews', async ()=>{
+			const brew = await createBrew({ text: 'x' }, 'old-name');
+			const res = await t.send('PUT', '/api/user/rename', { body: { username: 'old-name', newUsername: 'new-name' }, as: 'new-name' });
+
+			expect(res.status).toBe(200);
+			expect((await (await t.request(`/metadata/${brew.shareId}`)).json()).authors).toEqual(['new-name']);
+		});
+
+		it('only lets users rename to their own account', async ()=>{
+			const res = await t.send('PUT', '/api/user/rename', { body: { username: 'a', newUsername: 'b' }, as: 'c' });
+			expect(res.status).toBe(403);
+		});
+	});
+
+	describe('live updates', ()=>{
+		it('forwards WebSocket upgrades to the brew\'s Durable Object', async ()=>{
+			const res = await t.request('/api/stream/share0000001', { headers: { Upgrade: 'websocket' } });
+			expect(await res.text()).toBe('upgraded');
+		});
+
+		it('asks for an upgrade, and answers 204 when live updates are not configured', async ()=>{
+			expect((await t.request('/api/stream/share0000001')).status).toBe(426);
+
+			const withoutUpdates = await createTestApp();
+			expect((await withoutUpdates.request('/api/stream/share0000001', { headers: { Upgrade: 'websocket' } })).status).toBe(204);
+			withoutUpdates.close();
+		});
+	});
 });

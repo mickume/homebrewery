@@ -1,13 +1,8 @@
-// A D1-shaped database over node:sqlite for tests: prepare().bind().first()/all()/run(), batch() and exec(),
-// with the schema from migrations/ applied. Like D1, it enforces foreign keys, rejects undefined and boolean
-// parameters, and returns BLOBs as plain arrays of bytes.
+// A D1-shaped database over node:sqlite for tests: prepare().bind().first()/all()/run(), batch() and exec().
+// Like D1, it enforces foreign keys, rejects undefined and boolean parameters, and returns BLOBs as plain
+// arrays of bytes. It starts empty; apply the schema with server/storage/migrate.js.
 
 import { DatabaseSync } from 'node:sqlite';
-import fs   from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
-
-const MIGRATIONS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../migrations');
 
 const checkParams = (params)=>{
 	params.forEach((param, index)=>{
@@ -49,8 +44,6 @@ const createStatement = (sqlite, sql, params = [])=>{
 export default function createTestDatabase() {
 	const sqlite = new DatabaseSync(':memory:');
 	sqlite.exec('PRAGMA foreign_keys = ON');
-	for (const file of fs.readdirSync(MIGRATIONS_DIR).filter((name)=>name.endsWith('.sql')).sort())
-		sqlite.exec(fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8'));
 
 	return {
 		prepare : (sql)=>createStatement(sqlite, sql),

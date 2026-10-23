@@ -1,649 +1,122 @@
-/*eslint max-lines: ["warn", {"max": 1000, "skipBlankLines": true, "skipComments": true}]*/
-import mongoose from 'mongoose';
-import supertest from 'supertest';
-import createApp from './app.js';
-import { model as NotificationModel } from './notifications.model.js';
-import { model as HomebrewModel } from './homebrew.model.js';
+import { createTestApp, adminAuth } from '../tests/support/testApp.js';
+import createBrewStore from './storage/brewStore.js';
 
-let app;
-let request;
-let dbState;
+describe('Admin API', ()=>{
+	let t, brews;
 
-beforeAll(async ()=>{
-	app = await createApp();
-	request = supertest.agent(app).set('X-Forwarded-Proto', 'https');
-});
-
-describe('Tests for admin api', ()=>{
-	beforeEach(()=>{
-		dbState = mongoose.connection.readyState;
-		mongoose.connection.readyState = 1;
+	const json = async (res)=>({ status: res.status, body: await res.json() });
+	const admin = (method, url, body)=>t.request(url, {
+		method,
+		headers : { ...adminAuth(), 'Content-Type': 'application/json' },
+		body    : body === undefined ? undefined : JSON.stringify(body)
 	});
 
-	afterEach(()=>{
-		mongoose.connection.readyState = dbState;
-		jest.resetAllMocks();
+	beforeEach(async ()=>{
+		t = await createTestApp();
+		brews = createBrewStore(t.db);
 	});
 
-	afterAll(async ()=>{
-		await mongoose.connection.close();
-	});
+	afterEach(()=>t.close());
 
-	describe('Notifications', ()=>{
-		it('should return list of all notifications', async ()=>{
-			const testNotifications = ['a', 'b'];
+	describe('access', ()=>{
+		it('asks for basic auth, rejects wrong credentials and lets the admin in', async ()=>{
+			const anonymous = await t.request('/admin/stats');
+			expect(anonymous.status).toBe(401);
+			expect(anonymous.headers.get('WWW-Authenticate')).toMatch(/^Basic/);
 
-			jest.spyOn(NotificationModel, 'find').mockImplementationOnce(()=>{
-				return { exec: jest.fn().mockResolvedValue(testNotifications) };
-			});
-
-			const response = await request
-        .get('/admin/notification/all')
-        .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-			expect(response.status).toBe(200);
-			expect(response.body).toEqual(testNotifications);
+			expect((await t.request('/admin/stats', { headers: adminAuth('wrong') })).status).toBe(401);
+			expect((await admin('GET', '/admin/stats')).status).toBe(200);
 		});
 
-		it('should add a new notification', async ()=>{
-			const inputNotification = {
-				title      : 'Test Notification',
-				text       : 'This is a test notification',
-				startAt    : new Date().toISOString(),
-				stopAt     : new Date().toISOString(),
-				dismissKey : 'testKey'
-			};
-
-			const savedNotification = {
-				...inputNotification,
-				_id       : expect.any(String),
-				createdAt : expect.any(String),
-				startAt   : inputNotification.startAt,
-				stopAt    : inputNotification.stopAt
-			};
-
-			jest.spyOn(NotificationModel.prototype, 'save').mockImplementationOnce(function () {
-				return Promise.resolve(this);
-			});
-
-			const response = await request
-        .post('/admin/notification/add')
-        .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`)
-        .send(inputNotification);
-
-			expect(response.status).toBe(201);
-			expect(response.body).toEqual(savedNotification);
+		it('is disabled when no admin password is configured', async ()=>{
+			const unconfigured = await createTestApp({ ADMIN_PASSWORD: undefined });
+			expect((await unconfigured.request('/admin/stats', { headers: adminAuth('') })).status).toBe(401);
+			unconfigured.close();
 		});
 
-		it('should handle error adding a notification without dismissKey', async ()=>{
-			const inputNotification = {
-				title   : 'Test Notification',
-				text    : 'This is a test notification',
-				startAt : new Date().toISOString(),
-				stopAt  : new Date().toISOString()
-			};
-
-			jest.spyOn(NotificationModel.prototype, 'save').mockImplementationOnce(function () {
-				return Promise.resolve(this);
-			});
-
-			const response = await request
-        .post('/admin/notification/add')
-        .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`)
-        .send(inputNotification);
-
-			expect(response.status).toBe(500);
-			expect(response.body).toEqual({ message: 'Dismiss key is required!' });
-		});
-
-		it('should delete a notification based on its dismiss key', async ()=>{
-			const dismissKey = 'testKey';
-
-			jest.spyOn(NotificationModel, 'findOneAndDelete').mockImplementationOnce((key)=>{
-				return { exec: jest.fn().mockResolvedValue(key) };
-			});
-
-			const response = await request
-        .delete(`/admin/notification/delete/${dismissKey}`)
-        .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-			expect(NotificationModel.findOneAndDelete).toHaveBeenCalledWith({ dismissKey: 'testKey' });
-			expect(response.status).toBe(200);
-			expect(response.body).toEqual({ dismissKey: 'testKey' });
-		});
-
-		it('should handle error deleting a notification that doesnt exist', async ()=>{
-			const dismissKey = 'testKey';
-
-			jest.spyOn(NotificationModel, 'findOneAndDelete').mockImplementationOnce(()=>{
-				return { exec: jest.fn().mockResolvedValue() };
-			});
-
-			const response = await request
-        .delete(`/admin/notification/delete/${dismissKey}`)
-        .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-			expect(NotificationModel.findOneAndDelete).toHaveBeenCalledWith({ dismissKey: 'testKey' });
-			expect(response.status).toBe(500);
-			expect(response.body).toEqual({ message: 'Notification not found' });
+		it('renders the admin page', async ()=>{
+			const res = await admin('GET', '/admin');
+			expect(res.status).toBe(200);
+			expect(await res.text()).toContain('"url":"/admin"');
 		});
 	});
 
-	describe('Locks', ()=>{
-		describe('Count', ()=>{
-			it('Count of all locked documents', async ()=>{
-				const testNumber = 16777216;
+	describe('brews', ()=>{
+		it('reports stats, looks up brews and lists a user\'s brews', async ()=>{
+			const brew = await brews.create({ title: 'Found', authors: ['alice'], published: true });
+			await brews.create({ title: 'Draft', authors: ['alice'] });
 
-				jest.spyOn(HomebrewModel, 'countDocuments').mockImplementationOnce(()=>Promise.resolve(testNumber));
-
-				const response = await request
-          .get('/api/lock/count')
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-				expect(response.status).toBe(200);
-				expect(response.body).toEqual({ count: testNumber });
-			});
-
-			it('Handle error while fetching count of locked documents', async ()=>{
-				jest.spyOn(HomebrewModel, 'countDocuments').mockImplementationOnce(()=>Promise.reject());
-
-				const response = await request
-          .get('/api/lock/count')
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					HBErrorCode : '61',
-					message     : 'Unable to get lock count',
-					name        : 'Lock Count Error',
-					originalUrl : '/api/lock/count',
-					status      : 500
-				});
-			});
+			expect(await json(await admin('GET', '/admin/stats'))).toEqual({ status: 200, body: { totalBrews: 2, totalPublishedBrews: 1 } });
+			expect((await json(await admin('GET', `/admin/lookup/${brew.editId}`))).body.title).toBe('Found');
+			expect((await json(await admin('GET', `/admin/lookup/${brew.shareId}`))).body.title).toBe('Found');
+			expect((await json(await admin('GET', '/admin/user/list/alice'))).body.map((b)=>b.title)).toEqual(['Found', 'Draft']);
 		});
 
-		describe('Lists', ()=>{
-			it('Get list of all locked documents', async ()=>{
-				const testLocks = ['a', 'b'];
+		it('lists and deletes junk and lost brews', async ()=>{
+			const old = { updatedAt: '2020-01-01T00:00:00Z', lastViewed: '2020-01-01T00:00:00Z' };
+			await brews.create({ ...old, text: 'x', authors: ['someone'] });
+			await brews.create({ ...old, text: 'lost brew with enough text to not count as junk at all, no author', authors: [] });
 
-				jest.spyOn(HomebrewModel, 'aggregate').mockImplementationOnce(()=>Promise.resolve(testLocks));
-
-				const response = await request
-          .get('/api/locks')
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-				expect(response.status).toBe(200);
-				expect(response.body).toEqual({ lockedDocuments: testLocks });
-			});
-
-			it('Handle error while fetching list of all locked documents', async ()=>{
-				jest.spyOn(HomebrewModel, 'aggregate').mockImplementationOnce(()=>Promise.reject());
-
-				const response = await request
-          .get('/api/locks')
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					HBErrorCode : '68',
-					message     : 'Unable to get locked brew collection',
-					name        : 'Can Not Get Locked Brews',
-					originalUrl : '/api/locks',
-					status      : 500
-				});
-			});
-
-			it('Get list of all locked documents with pending review requests', async ()=>{
-				const testLocks = ['a', 'b'];
-
-				jest.spyOn(HomebrewModel, 'aggregate').mockImplementationOnce(()=>Promise.resolve(testLocks));
-
-				const response = await request
-          .get('/api/lock/reviews')
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-				expect(response.status).toBe(200);
-				expect(response.body).toEqual({ reviewDocuments: testLocks });
-			});
-
-			it('Handle error while fetching list of all locked documents with pending review requests', async ()=>{
-				jest.spyOn(HomebrewModel, 'aggregate').mockImplementationOnce(()=>Promise.reject());
-
-				const response = await request
-          .get('/api/lock/reviews')
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					HBErrorCode : '68',
-					message     : 'Unable to get review collection',
-					name        : 'Can Not Get Reviews',
-					originalUrl : '/api/lock/reviews',
-					status      : 500
-				});
-			});
+			expect((await json(await admin('GET', '/admin/cleanupJunk'))).body.count).toBe(2);
+			expect((await json(await admin('GET', '/admin/cleanupLost'))).body.count).toBe(1);
+			expect((await json(await admin('POST', '/admin/cleanupLost'))).body).toEqual({ count: 1 });
+			expect((await json(await admin('POST', '/admin/cleanupJunk'))).body).toEqual({ count: 1 });
+			expect((await brews.stats()).totalBrews).toBe(0);
 		});
 
-		describe('Lock', ()=>{
-			it('Lock a brew', async ()=>{
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>true,
-					save         : ()=>Promise.resolve()
-				};
+		it('strips script tags from a brew', async ()=>{
+			const brew = await brews.create({ title: 'Bad <script>', text: 'Hi <script>alert(1)</script>', description: '' });
 
-				const testLock = {
-					code         : 999,
-					editMessage  : 'edit',
-					shareMessage : 'share'
-				};
+			const res = await admin('PUT', `/admin/clean/script/${brew.shareId}`);
 
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(testBrew));
+			expect(res.status).toBe(200);
+			expect(await brews.getByEditId(brew.editId)).toMatchObject({ title: 'Bad >', text: 'Hi >alert(1)>', version: 2 });
+		});
+	});
 
-				const response = await request
-          .post(`/api/lock/${testBrew.shareId}`)
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`)
-          .send(testLock);
-
-				expect(response.status).toBe(200);
-				expect(response.body).toMatchObject({
-					applied      : expect.any(String),
-					code         : testLock.code,
-					editMessage  : testLock.editMessage,
-					shareMessage : testLock.shareMessage,
-					name         : 'LOCKED',
-					message      : `Lock applied to brew ID ${testBrew.shareId} - ${testBrew.title}`
-				});
-			});
-
-			it('Overwrite lock on a locked brew', async ()=>{
-				const testLock = {
-					code         : 999,
-					editMessage  : 'newEdit',
-					shareMessage : 'newShare',
-					overwrite    : true
-				};
-
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>true,
-					save         : ()=>Promise.resolve(),
-					lock         : {
-						code         : 1,
-						editMessage  : 'oldEdit',
-						shareMessage : 'oldShare'
-					}
-				};
-
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(testBrew));
-
-				const response = await request
-          .post(`/api/lock/${testBrew.shareId}`)
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`)
-          .send(testLock);
-
-				expect(response.status).toBe(200);
-				expect(response.body).toMatchObject({
-					applied      : expect.any(String),
-					code         : testLock.code,
-					editMessage  : testLock.editMessage,
-					shareMessage : testLock.shareMessage,
-					name         : 'LOCKED',
-					message      : `Lock applied to brew ID ${testBrew.shareId} - ${testBrew.title}`
-				});
-			});
-
-			it('Error when locking a locked brew', async ()=>{
-				const testLock = {
-					code         : 999,
-					editMessage  : 'newEdit',
-					shareMessage : 'newShare'
-				};
-
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>true,
-					save         : ()=>Promise.resolve(),
-					lock         : {
-						code         : 1,
-						editMessage  : 'oldEdit',
-						shareMessage : 'oldShare'
-					}
-				};
-
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(testBrew));
-
-				const response = await request
-          .post(`/api/lock/${testBrew.shareId}`)
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`)
-          .send(testLock);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					HBErrorCode : '64',
-					message     : 'Lock already exists on brew',
-					name        : 'Already Locked',
-					originalUrl : `/api/lock/${testBrew.shareId}`,
-					shareId     : testBrew.shareId,
-					status      : 500,
-					title       : 'title'
-				});
-			});
-
-			it('Handle save error while locking a brew', async ()=>{
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>true,
-					save         : ()=>Promise.reject()
-				};
-
-				const testLock = {
-					code         : 999,
-					editMessage  : 'edit',
-					shareMessage : 'share'
-				};
-
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(testBrew));
-
-				const response = await request
-          .post(`/api/lock/${testBrew.shareId}`)
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`)
-          .send(testLock);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					HBErrorCode : '62',
-					message     : 'Unable to set lock',
-					name        : 'Lock Error',
-					originalUrl : `/api/lock/${testBrew.shareId}`,
-					shareId     : testBrew.shareId,
-					status      : 500
-				});
-			});
+	describe('locks', ()=>{
+		let brew;
+		beforeEach(async ()=>{
+			brew = await brews.create({ title: 'Lockable' });
 		});
 
-		describe('Unlock', ()=>{
-			it('Unlock a brew', async ()=>{
-				const testLock = {
-					applied      : 'YES',
-					code         : 999,
-					editMessage  : 'edit',
-					shareMessage : 'share'
-				};
+		it('locks, lists, reviews and unlocks a brew', async ()=>{
+			const lock = await json(await admin('POST', `/api/lock/${brew.shareId}`, { code: 455, shareMessage: 'Locked', editMessage: 'Locked' }));
+			expect(lock).toMatchObject({ status: 200, body: { name: 'LOCKED', code: 455 } });
 
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>true,
-					save         : ()=>Promise.resolve(),
-					lock         : testLock
-				};
+			expect((await json(await admin('POST', `/api/lock/${brew.shareId}`, { code: 1 }))).body.HBErrorCode).toBe('64');
+			expect((await json(await admin('POST', `/api/lock/${brew.shareId}`, { code: 2, overwrite: true }))).status).toBe(200);
 
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(testBrew));
+			expect((await json(await admin('GET', '/api/lock/count'))).body).toEqual({ count: 1 });
+			expect((await json(await admin('GET', '/api/locks'))).body.lockedDocuments[0]).toMatchObject({ shareId: brew.shareId, lock: { code: 2 } });
 
-				const response = await request.put(`/api/unlock/${testBrew.shareId}`).set(
-					'Authorization',
-					`Basic ${Buffer.from('admin:password3').toString('base64')}`
-				);
+			// Any user may request a review, once
+			expect((await t.request(`/api/lock/review/request/${brew.shareId}`, { method: 'PUT' })).status).toBe(200);
+			expect((await json(await t.request(`/api/lock/review/request/${brew.shareId}`, { method: 'PUT' }))).body.HBErrorCode).toBe('71');
+			expect((await json(await admin('GET', '/api/lock/reviews'))).body.reviewDocuments).toHaveLength(1);
+			expect((await admin('PUT', `/api/lock/review/remove/${brew.shareId}`)).status).toBe(200);
+			expect((await json(await admin('GET', '/api/lock/reviews'))).body.reviewDocuments).toHaveLength(0);
 
-				expect(response.status).toBe(200);
-				expect(response.body).toEqual({
-					name    : 'Unlocked',
-					message : `Lock removed from brew ID ${testBrew.shareId}`
-				});
-			});
-
-			it('Error when unlocking a brew with no lock', async ()=>{
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>true,
-					save         : ()=>Promise.resolve()
-				};
-
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(testBrew));
-
-				const response = await request.put(`/api/unlock/${testBrew.shareId}`).set(
-					'Authorization',
-					`Basic ${Buffer.from('admin:password3').toString('base64')}`
-				);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					HBErrorCode : '67',
-					message     : 'Cannot unlock as brew is not locked',
-					name        : 'Not Locked',
-					originalUrl : `/api/unlock/${testBrew.shareId}`,
-					shareId     : testBrew.shareId,
-					status      : 500
-				});
-			});
-
-			it('Handle error while unlocking a brew', async ()=>{
-				const testLock = {
-					applied      : 'YES',
-					code         : 999,
-					editMessage  : 'edit',
-					shareMessage : 'share'
-				};
-
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>true,
-					save         : ()=>Promise.reject(),
-					lock         : testLock
-				};
-
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(testBrew));
-
-				const response = await request.put(`/api/unlock/${testBrew.shareId}`).set(
-					'Authorization',
-					`Basic ${Buffer.from('admin:password3').toString('base64')}`
-				);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					HBErrorCode : '65',
-					message     : 'Unable to clear lock',
-					name        : 'Cannot Unlock',
-					originalUrl : `/api/unlock/${testBrew.shareId}`,
-					shareId     : testBrew.shareId,
-					status      : 500
-				});
-			});
+			expect((await admin('PUT', `/api/unlock/${brew.shareId}`)).status).toBe(200);
+			expect((await json(await admin('PUT', `/api/unlock/${brew.shareId}`))).body.HBErrorCode).toBe('67');
 		});
 
-		describe('Reviews', ()=>{
-			it('Add review request to a locked brew', async ()=>{
-				const testLock = {
-					applied      : 'YES',
-					code         : 999,
-					editMessage  : 'edit',
-					shareMessage : 'share'
-				};
+		it('reports unknown brews', async ()=>{
+			expect((await json(await admin('POST', '/api/lock/missing00001', { code: 1 }))).body.HBErrorCode).toBe('63');
+			expect((await json(await t.request('/api/lock/review/request/missing00001', { method: 'PUT' }))).body.HBErrorCode).toBe('70');
+		});
+	});
 
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>true,
-					save         : ()=>Promise.resolve(),
-					lock         : testLock
-				};
+	describe('notifications', ()=>{
+		it('adds, lists publicly and deletes notifications', async ()=>{
+			expect((await admin('POST', '/admin/notification/add', { dismissKey: 'hello', title: 'Hi' })).status).toBe(201);
+			expect((await json(await admin('POST', '/admin/notification/add', { dismissKey: 'hello' }))).status).toBe(400);
+			expect((await t.request('/admin/notification/add', { method: 'POST', body: '{}' })).status).toBe(401);
 
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(testBrew));
+			expect((await json(await t.request('/admin/notification/all'))).body).toEqual([expect.objectContaining({ dismissKey: 'hello', title: 'Hi' })]);
 
-				const response = await request.put(`/api/lock/review/request/${testBrew.shareId}`);
-
-				expect(response.status).toBe(200);
-				expect(response.body).toEqual({
-					message : `Review requested on brew ID ${testBrew.shareId} - ${testBrew.title}`,
-					name    : 'Review Requested'
-				});
-			});
-
-			it('Error when cannot find a locked brew', async ()=>{
-				const testBrew = { shareId: 'shareId' };
-
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(false));
-
-				const response = await request.put(`/api/lock/review/request/${testBrew.shareId}`);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					message     : `Cannot find a locked brew with ID ${testBrew.shareId}`,
-					name        : 'Brew Not Found',
-					HBErrorCode : '70',
-					code        : 500,
-					originalUrl : `/api/lock/review/request/${testBrew.shareId}`
-				});
-			});
-
-			it('Error when review is already requested', async ()=>{
-				const testLock = {
-					applied         : 'YES',
-					code            : 999,
-					editMessage     : 'edit',
-					shareMessage    : 'share',
-					reviewRequested : 'YES'
-				};
-
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>{ return true; },
-					save         : ()=>{ return Promise.resolve(); },
-					lock         : testLock
-				};
-
-				jest.spyOn(HomebrewModel, 'findOne')
-				.mockImplementationOnce(()=>Promise.resolve(testBrew));
-
-				const response = await request
-				.put(`/api/lock/review/request/${testBrew.shareId}`);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					HBErrorCode : '71',
-					code        : 500,
-					message     : `Review already requested for brew ${testBrew.shareId} - ${testBrew.title}`,
-					name        : 'Review Already Requested',
-					originalUrl : `/api/lock/review/request/${testBrew.shareId}`
-				});
-			});
-			it('Handle error while adding review request to a locked brew', async ()=>{
-				const testLock = {
-					applied      : 'YES',
-					code         : 999,
-					editMessage  : 'edit',
-					shareMessage : 'share'
-				};
-
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>true,
-					save         : ()=>Promise.reject(),
-					lock         : testLock
-				};
-
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(testBrew));
-
-				const response = await request.put(`/api/lock/review/request/${testBrew.shareId}`);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					HBErrorCode : '69',
-					code        : 500,
-					message     : `Unable to set request for review on brew ID ${testBrew.shareId}`,
-					name        : 'Can Not Set Review Request',
-					originalUrl : `/api/lock/review/request/${testBrew.shareId}`
-				});
-			});
-
-			it('Clear review request from a locked brew', async ()=>{
-				const testLock = {
-					applied         : 'YES',
-					code            : 999,
-					editMessage     : 'edit',
-					shareMessage    : 'share',
-					reviewRequested : 'YES'
-				};
-
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>true,
-					save         : ()=>Promise.resolve(),
-					lock         : testLock
-				};
-
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(testBrew));
-
-				const response = await request
-          .put(`/api/lock/review/remove/${testBrew.shareId}`)
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-				expect(response.status).toBe(200);
-				expect(response.body).toEqual({
-					message : `Review request removed for brew ID ${testBrew.shareId} - ${testBrew.title}`,
-					name    : 'Review Request Cleared'
-				});
-			});
-
-			it('Error when clearing review request from a brew with no review request', async ()=>{
-				const testBrew = { shareId: 'shareId' };
-
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(false));
-
-				const response = await request
-          .put(`/api/lock/review/remove/${testBrew.shareId}`)
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					HBErrorCode : '73',
-					message     : `Brew ID ${testBrew.shareId} does not have a review pending!`,
-					name        : 'Can Not Clear Review Request',
-					originalUrl : `/api/lock/review/remove/${testBrew.shareId}`
-				});
-			});
-
-			it('Handle error while clearing review request from a locked brew', async ()=>{
-				const testLock = {
-					applied         : 'YES',
-					code            : 999,
-					editMessage     : 'edit',
-					shareMessage    : 'share',
-					reviewRequested : 'YES'
-				};
-
-				const testBrew = {
-					shareId      : 'shareId',
-					title        : 'title',
-					markModified : ()=>true,
-					save         : ()=>Promise.reject(),
-					lock         : testLock
-				};
-
-				jest.spyOn(HomebrewModel, 'findOne').mockImplementationOnce(()=>Promise.resolve(testBrew));
-
-				const response = await request
-          .put(`/api/lock/review/remove/${testBrew.shareId}`)
-          .set('Authorization', `Basic ${Buffer.from('admin:password3').toString('base64')}`);
-
-				expect(response.status).toBe(500);
-				expect(response.body).toEqual({
-					HBErrorCode : '72',
-					message     : `Unable to remove request for review on brew ID ${testBrew.shareId}`,
-					name        : 'Can Not Clear Review Request',
-					originalUrl : `/api/lock/review/remove/${testBrew.shareId}`
-				});
-			});
+			expect((await admin('DELETE', '/admin/notification/delete/hello')).status).toBe(200);
+			expect((await admin('DELETE', '/admin/notification/delete/hello')).status).toBe(404);
 		});
 	});
 });

@@ -167,10 +167,11 @@ const debugTextMismatch = (clientTextRaw, serverTextRaw, label)=>{
 	const clientText = clientTextRaw?.normalize('NFC') || '';
 	const serverText = serverTextRaw?.normalize('NFC') || '';
 
-	const clientBuffer = Buffer.from(clientText, 'utf8');
-	const serverBuffer = Buffer.from(serverText, 'utf8');
+	const encoder = new TextEncoder();
+	const clientBuffer = encoder.encode(clientText);
+	const serverBuffer = encoder.encode(serverText);
 
-	if(clientBuffer.equals(serverBuffer)) {
+	if(clientBuffer.length === serverBuffer.length && clientBuffer.every((byte, i)=>byte === serverBuffer[i])) {
 		console.log(`✅ ${label} text matches byte-for-byte.`);
 		return;
 	}

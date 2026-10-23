@@ -4,7 +4,6 @@
 // `authors` as an ordered array, `text` uncompressed). Rows are addressed by editId or shareId;
 // the internal integer id never leaves this module.
 
-import zlib       from 'zlib';
 import { nanoid } from 'nanoid';
 
 // D1 rejects rows over 2,000,000 bytes; leave headroom for the other columns
@@ -36,21 +35,26 @@ const toFlag = (value)=>value === undefined ? null : Number(Boolean(value));
 const toJSON = (value)=>value === undefined ? null : JSON.stringify(value);
 const toDate = (value)=>value === undefined ? null : new Date(value).toISOString();
 
-const compressText = (text)=>{
-	const compressed = zlib.deflateRawSync(text);
-	if(compressed.length > MAX_TEXT_BYTES) {
-		throw {
-			name        : 'BrewSave Error',
-			message     : `Brew is too large to save: ${compressed.length} bytes compressed, the limit is ${MAX_TEXT_BYTES}`,
-			status      : 413,
-			HBErrorCode : '14'
-		};
-	}
-	return new Uint8Array(compressed);
+// Runs bytes through a CompressionStream or DecompressionStream (web standard, no Node.js APIs needed)
+const transformBytes = async (bytes, transform)=>{
+	const stream = new Blob([bytes]).stream().pipeThrough(transform);
+	return new Uint8Array(await new Response(stream).arrayBuffer());
 };
 
-// D1 returns BLOBs as arrays of bytes or ArrayBuffers depending on the runtime; Buffer.from takes all of them
-const decompressText = (textBin)=>zlib.inflateRawSync(Buffer.from(textBin)).toString();
+const compressText = async (text)=>{
+	const compressed = await transformBytes(new TextEncoder().encode(text), new CompressionStream('deflate-raw'));
+	if(compressed.length > MAX_TEXT_BYTES) {
+		const message = `Brew is too large to save: ${compressed.length} bytes compressed, the limit is ${MAX_TEXT_BYTES}`;
+		throw Object.assign(new Error(message), { name: 'BrewSave Error', status: 413, HBErrorCode: '14' });
+	}
+	return compressed;
+};
+
+// D1 returns BLOBs as arrays of bytes or ArrayBuffers depending on the runtime; Uint8Array takes both
+const decompressText = async (textBin)=>{
+	const bytes = await transformBytes(new Uint8Array(textBin), new DecompressionStream('deflate-raw'));
+	return new TextDecoder().decode(bytes);
+};
 
 const toBrew = (row)=>{
 	if(!row) return null;
@@ -74,8 +78,6 @@ const toBrew = (row)=>{
 		version        : row.version,
 		lock           : row.lock ? JSON.parse(row.lock) : undefined
 	};
-	if(row.text_bin !== undefined)
-		brew.text = row.text_bin === null ? '' : decompressText(row.text_bin);
 	return brew;
 };
 
@@ -103,7 +105,9 @@ const searchConditions = ({ title, author, renderer })=>{
 export default function createBrewStore(db, { now = ()=>new Date() } = {}) {
 	const getOne = async (where, params)=>{
 		const row = await db.prepare(`SELECT ${ALL_COLUMNS} FROM brews b WHERE ${where}`).bind(...params).first();
-		return toBrew(row);
+		const brew = toBrew(row);
+		if(brew) brew.text = row.text_bin === null ? '' : await decompressText(row.text_bin);
+		return brew;
 	};
 
 	const insertAuthorsStatement = (editId, authors)=>db.prepare(`INSERT INTO brew_authors (brew_id, position, username)
@@ -175,7 +179,7 @@ export default function createBrewStore(db, { now = ()=>new Date() } = {}) {
 				db.prepare(`INSERT INTO brews (share_id, edit_id, title, text_bin, page_count, description, tags, lang, renderer,
 					invited_authors, published, thumbnail, created_at, updated_at, last_viewed, views, version)
 					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
-					shareId, editId, brew.title ?? '', compressText(brew.text ?? ''), brew.pageCount ?? 1, brew.description ?? '',
+					shareId, editId, brew.title ?? '', await compressText(brew.text ?? ''), brew.pageCount ?? 1, brew.description ?? '',
 					JSON.stringify(brew.tags ?? []), brew.lang ?? 'en', brew.renderer ?? '', JSON.stringify(brew.invitedAuthors ?? []),
 					brew.published ? 1 : 0, brew.thumbnail ?? '', toDate(brew.createdAt) ?? timestamp, toDate(brew.updatedAt) ?? timestamp,
 					toDate(brew.lastViewed) ?? timestamp, brew.views ?? 0, brew.version ?? 1
@@ -190,7 +194,7 @@ export default function createBrewStore(db, { now = ()=>new Date() } = {}) {
 		// still matches. Views, lastViewed and lock are never changed here. Returns the stored brew, or
 		// null when no brew matched.
 		update : async (editId, brew, { expectedVersion } = {})=>{
-			const textBin = brew.text === undefined ? null : compressText(brew.text);
+			const textBin = brew.text === undefined ? null : await compressText(brew.text);
 			const { meta } = await db.prepare(`UPDATE brews SET
 				title = COALESCE(?, title), text_bin = COALESCE(?, text_bin), page_count = COALESCE(?, page_count),
 				description = COALESCE(?, description), tags = COALESCE(?, tags), lang = COALESCE(?, lang),

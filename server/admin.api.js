@@ -1,437 +1,149 @@
-/*eslint max-lines: ["warn", {"max": 500, "skipBlankLines": true, "skipComments": true}]*/
-import { model as HomebrewModel }     from './homebrew.model.js';
-import { model as NotificationModel } from './notifications.model.js';
-import express    from 'express';
-import Moment     from 'moment';
-import zlib       from 'zlib';
-import config  from './config.js';
-import path from 'path';
-import fs      from 'fs-extra';
+/*eslint max-lines: ["warn", {"max": 300, "skipBlankLines": true, "skipComments": true}]*/
+// Admin tools and the lock/notification APIs. Everything here except the review request and the public
+// notification list sits behind HTTP basic auth with ADMIN_USER / ADMIN_PASSWORD.
 
-const nodeEnv = config.get('node_env');
-const isProd = nodeEnv === 'production';
+import { Hono }            from 'hono';
+import { basicAuth }       from 'hono/basic-auth';
+import { timingSafeEqual } from 'hono/utils/buffer';
+import { getBrew }         from './homebrew.api.js';
+import { renderPage }      from './render.js';
+import { hbError }         from './errors.js';
 
-import HomebrewAPI  from './homebrew.api.js';
-import asyncHandler from 'express-async-handler';
+// Admin access is off unless an admin password is configured
+const adminOnly = basicAuth({
+	verifyUser : async (username, password, c)=>{
+		const { adminUser, adminPassword } = c.get('config');
+		if(!adminPassword) return false;
+		const [userMatches, passwordMatches] = await Promise.all([
+			timingSafeEqual(username, adminUser),
+			timingSafeEqual(password, adminPassword)
+		]);
+		return userMatches && passwordMatches;
+	},
+	invalidUserMessage : { HBErrorCode: '52', message: 'Access denied' }
+});
 
-process.env.ADMIN_USER = process.env.ADMIN_USER || 'admin';
-process.env.ADMIN_PASS = process.env.ADMIN_PASS || 'password3';
+const brews = (c)=>c.get('stores').brews;
 
-export default function createAdminApi(vite) {
-	const router = express.Router();
+const router = new Hono();
 
-	const mw = {
-		adminOnly : (req, res, next)=>{
-			if(!req.get('authorization')){
-				return res
-				.set('WWW-Authenticate', 'Basic realm="Authorization Required"')
-				.status(401)
-				.send('Authorization Required');
-			}
-			const [username, password] = Buffer.from(req.get('authorization').split(' ').pop(), 'base64')
-			.toString('ascii')
-			.split(':');
-			if(process.env.ADMIN_USER === username && process.env.ADMIN_PASS === password){
-				return next();
-			}
-			throw { HBErrorCode: '52', code: 401, message: 'Access denied' };
-		}
-	};
+router.get('/admin', adminOnly, (c)=>renderPage(c, { url: new URL(c.req.url).pathname }));
 
-	// Search for up to 300 brews that have not been viewed or updated in 30 days and are shorter than 140 bytes
-	const junkBrewsPipeline = [
-		{	$match : {
-			updatedAt  : { $lt: Moment().subtract(30, 'days').toDate() },
-			lastViewed : { $lt: Moment().subtract(30, 'days').toDate() }
-		} },
-		{ $project: { _id: 1, textBinSize: { $binarySize: '$textBin' }, updatedAt: 1, lastViewed: 1 } },
-		{ $match: { textBinSize: { $lt: 140 } } },
-		{ $limit: 300 }
-	];
+//==== Brew maintenance ====//
 
-	// Search for up to 500 unauthored brews that have not been viewed or updated in two years
-	const lostBrewsPipeline = [
-		{
-			$match : {
-				authors    : [],
-				updatedAt  : { $lt: Moment().subtract(2, 'years').toDate() },
-				lastViewed : { $lt: Moment().subtract(2, 'years').toDate() }
-			}
-		},
-		{
-			$limit : 500
-		}
-	];
+router.get('/admin/cleanupJunk', adminOnly, async (c)=>{
+	const brewCollection = await brews(c).listJunk();
+	return c.json({ count: brewCollection.length, brewCollection });
+});
+router.post('/admin/cleanupJunk', adminOnly, async (c)=>c.json({ count: await brews(c).deleteJunk() }));
 
-	/* Search for brews that aren't compressed (missing the compressed text field) */
-	const uncompressedBrewQuery = HomebrewModel.find({
-		'text' : { '$exists': true }
-	}).lean().limit(10000).select('_id');
+router.get('/admin/cleanupLost', adminOnly, async (c)=>{
+	const brewCollection = await brews(c).listLost();
+	return c.json({ count: brewCollection.length, brewCollection });
+});
+router.post('/admin/cleanupLost', adminOnly, async (c)=>c.json({ count: await brews(c).deleteLost() }));
 
-	router.get('/admin/cleanupJunk', mw.adminOnly, (req, res)=>{
-		HomebrewModel.aggregate(junkBrewsPipeline).option({ maxTimeMS: 60000 })
-		.then((objs)=>res.json({ count: objs.length, brewCollection: objs }))
-		.catch((error)=>{
-			console.error(error);
-			res.status(500).json({ error: 'Internal Server Error' });
-		});
+// Finds a brew by edit or share id
+router.get('/admin/lookup/:id', adminOnly, async (c)=>c.json(await getBrew(c, 'admin')));
+
+// Strips `<script` and `</script>` from a brew's text, description and title
+router.put('/admin/clean/script/:id', adminOnly, async (c)=>{
+	const brew = await brews(c).getByAnyId(c.req.param('id'));
+	if(!brew) throw hbError({ name: 'Brew Not Found', message: 'Cannot find brew to clean', status: 404, HBErrorCode: '05', brewId: c.req.param('id') });
+	console.log(`[ADMIN] Cleaning script tags from ShareID ${brew.shareId}`);
+
+	const cleanText = (text)=>text.replaceAll(/(<\/?s)cript/gi, '');
+	const saved = await brews(c).update(brew.editId, {
+		text        : cleanText(brew.text),
+		title       : cleanText(brew.title),
+		description : cleanText(brew.description),
+		version     : brew.version + 1,
+		updatedAt   : new Date()
 	});
-
-	// Delete result of junkBrewsPipeline
-	router.post('/admin/cleanupJunk', mw.adminOnly, (req, res)=>{
-		HomebrewModel.aggregate(junkBrewsPipeline).option({ maxTimeMS: 60000 })
-		.then((docs)=>{
-			const ids = docs.map((doc)=>doc._id);
-			return HomebrewModel.deleteMany({ _id: { $in: ids } });
-		}).then((result)=>{
-			res.json({ count: result.deletedCount });
-		}).catch((error)=>{
-			console.error(error);
-			res.status(500).json({ error: 'Internal Server Error' });
-		});
-	});
-
-	router.get('/admin/cleanupLost', mw.adminOnly, (req, res)=>{
-		HomebrewModel.aggregate(lostBrewsPipeline).option({ maxTimeMS: 60000 })
-		.then((objs)=>res.json({ count: objs.length, brewCollection: objs }))
-		.catch((error)=>{
-			console.error(error);
-			res.status(500).json({ error: 'Internal Server Error' });
-		});
-	});
-
-	// Delete result of lostBrewsPipeline
-	router.post('/admin/cleanupLost', mw.adminOnly, (req, res)=>{
-		HomebrewModel.aggregate(lostBrewsPipeline).option({ maxTimeMS: 60000 })
-		.then((docs)=>{
-			const ids = docs.map((doc)=>doc._id);
-			return HomebrewModel.deleteMany({ _id: { $in: ids } });
-		}).then((result)=>{
-			res.json({ count: result.deletedCount });
-		}).catch((error)=>{
-			console.error(error);
-			res.status(500).json({ error: 'Internal Server Error' });
-		});
-	});
-
-	/* Searches for matching edit or share id, also attempts to partial match */
-	router.get('/admin/lookup/:id', mw.adminOnly, asyncHandler(HomebrewAPI.getBrew('admin', false)), async (req, res, next)=>{
-		return res.json(req.brew);
-	});
-
-	/* Find 50 brews that aren't compressed yet */
-	router.get('/admin/finduncompressed', mw.adminOnly, (req, res)=>{
-		const query = uncompressedBrewQuery.clone();
-
-		query.exec()
-		.then((objs)=>{
-			const ids = objs.map((obj)=>obj._id);
-			res.json({ count: ids.length, ids });
-		})
-		.catch((err)=>{
-			console.error(err);
-			res.status(500).send(err.message || 'Internal Server Error');
-		});
-	});
-
-	/* Cleans `<script` and `</script>` from the "text" field of a brew */
-	router.put('/admin/clean/script/:id', asyncHandler(HomebrewAPI.getBrew('admin', false)), async (req, res)=>{
-		console.log(`[ADMIN: ${req.account?.username || 'Not Logged In'}] Cleaning script tags from ShareID ${req.params.id}`);
-
-		function cleanText(text){return text.replaceAll(/(<\/?s)cript/gi, '');};
-
-		const brew = req.brew;
-
-		const properties = ['text', 'description', 'title'];
-		properties.forEach((property)=>{
-			brew[property] = cleanText(brew[property]);
-		});
-
-		req.body = brew;
-
-		// Remove Account from request to prevent Admin user from being added to brew as an Author
-		req.account = undefined;
-
-		return await HomebrewAPI.updateBrew(req, res);
-	});
-
-	/* Get list of a user's documents */
-	router.get('/admin/user/list/:user', mw.adminOnly, async (req, res)=>{
-		const username = req.params.user;
-		const fields = { _id: 0, text: 0, textBin: 0 };		// Remove unnecessary fields from document lists
-
-		console.log(`[ADMIN: ${req.account?.username || 'Not Logged In'}] Get brew list for ${username}`);
-
-		const brews = await HomebrewModel.getByUser(username, true, fields);
-
-		return res.json(brews);
-	});
-
-	/* Compresses the "text" field of a brew to binary */
-	router.put('/admin/compress/:id', (req, res)=>{
-		HomebrewModel.findOne({ _id: req.params.id })
-		.then((brew)=>{
-			if(!brew)
-				return res.status(404).send('Brew not found');
-
-			if(brew.text) {
-				brew.textBin = brew.textBin || zlib.deflateRawSync(brew.text);	//Don't overwrite textBin if exists
-				brew.text = undefined;
-			}
-
-			return brew.save();
-		})
-		.then((obj)=>res.status(200).send(obj))
-		.catch((err)=>{
-			console.error(err);
-			res.status(500).send('Error while saving');
-		});
-	});
-
-	router.get('/admin/stats', mw.adminOnly, async (req, res)=>{
-		try {
-			const totalBrewsCount = await HomebrewModel.countDocuments({});
-			const publishedBrewsCount = await HomebrewModel.countDocuments({ published: true });
-
-			return res.json({
-				totalBrews          : totalBrewsCount,
-				totalPublishedBrews : publishedBrewsCount
-			});
-		} catch (error) {
-			console.error(error);
-			return res.status(500).json({ error: 'Internal Server Error' });
-		}
-	});
-
-	// #######################   LOCKS
-
-	router.get('/api/lock/count', mw.adminOnly, asyncHandler(async (req, res)=>{
-
-		const countLocksQuery = {
-			lock : { $exists: true }
-		};
-		const count = await HomebrewModel.countDocuments(countLocksQuery)
-		.catch((error)=>{
-			throw { name: 'Lock Count Error', message: 'Unable to get lock count', status: 500, HBErrorCode: '61', error };
-		});
-
-		return res.json({ count });
-
-	}));
-
-	router.get('/api/locks', mw.adminOnly, asyncHandler(async (req, res)=>{
-		const countLocksPipeline = [
-			{
-			  $match :
-				{
-				  'lock' : { '$exists': 1 }
-				},
-			},
-			{
-				$project : {
-					shareId : 1,
-					editId  : 1,
-					title   : 1,
-					lock    : 1
-				}
-			}
-		];
-		const lockedDocuments = await HomebrewModel.aggregate(countLocksPipeline)
-		.catch((error)=>{
-			throw { name: 'Can Not Get Locked Brews', message: 'Unable to get locked brew collection', status: 500, HBErrorCode: '68', error };
-		});
-		return res.json({
-			lockedDocuments
-		});
-
-	}));
-
-	router.post('/api/lock/:id', mw.adminOnly, asyncHandler(async (req, res)=>{
-
-		const lock = req.body;
-
-		lock.applied = new Date;
-
-		const filter = {
-			shareId : req.params.id
-		};
-
-		const brew = await HomebrewModel.findOne(filter);
-
-		if(!brew) throw { name: 'Brew Not Found', message: 'Cannot find brew to lock', shareId: req.params.id, status: 500, HBErrorCode: '63' };
-
-		if(brew.lock && !lock.overwrite) {
-			throw { name: 'Already Locked', message: 'Lock already exists on brew', shareId: req.params.id, title: brew.title, status: 500, HBErrorCode: '64' };
-		}
-
-		lock.overwrite = undefined;
-
-		brew.lock = lock;
-		brew.markModified('lock');
-
-		await brew.save()
-		.catch((error)=>{
-			throw { name: 'Lock Error', message: 'Unable to set lock', shareId: req.params.id, status: 500, HBErrorCode: '62', error };
-		});
-
-		return res.json({ name: 'LOCKED', message: `Lock applied to brew ID ${brew.shareId} - ${brew.title}`, ...lock });
-
-	}));
-
-	router.put('/api/unlock/:id', mw.adminOnly, asyncHandler(async (req, res)=>{
-
-		const filter = {
-			shareId : req.params.id
-		};
-
-		const brew = await HomebrewModel.findOne(filter);
-
-		if(!brew) throw { name: 'Brew Not Found', message: 'Cannot find brew to unlock', shareId: req.params.id, status: 500, HBErrorCode: '66' };
-
-		if(!brew.lock) throw { name: 'Not Locked', message: 'Cannot unlock as brew is not locked', shareId: req.params.id, status: 500, HBErrorCode: '67' };
-
-		brew.lock = undefined;
-		brew.markModified('lock');
-
-		await brew.save()
-		.catch((error)=>{
-			throw { name: 'Cannot Unlock', message: 'Unable to clear lock', shareId: req.params.id, status: 500, HBErrorCode: '65', error };
-		});
-
-		return res.json({ name: 'Unlocked', message: `Lock removed from brew ID ${req.params.id}` });
-	}));
-
-	router.get('/api/lock/reviews', mw.adminOnly, asyncHandler(async (req, res)=>{
-		const countReviewsPipeline = [
-			{
-			  $match :
-				{
-				  'lock.reviewRequested' : { '$exists': 1 }
-				},
-			},
-			{
-				$project : {
-					shareId : 1,
-					editId  : 1,
-					title   : 1,
-					lock    : 1
-				}
-			}
-		];
-		const reviewDocuments = await HomebrewModel.aggregate(countReviewsPipeline)
-		.catch((error)=>{
-			throw { name: 'Can Not Get Reviews', message: 'Unable to get review collection', status: 500, HBErrorCode: '68', error };
-		});
-		return res.json({
-			reviewDocuments
-		});
-
-	}));
-
-	router.put('/api/lock/review/request/:id', asyncHandler(async (req, res)=>{
-	// === This route is NOT Admin only ===
-	// Any user can request a review of their document
-		const filter = {
-			shareId : req.params.id,
-			lock    : { $exists: 1 }
-		};
-
-		const brew = await HomebrewModel.findOne(filter);
-		if(!brew) { throw { name: 'Brew Not Found', message: `Cannot find a locked brew with ID ${req.params.id}`, code: 500, HBErrorCode: '70' }; };
-
-		if(brew.lock.reviewRequested){
-			throw { name: 'Review Already Requested', message: `Review already requested for brew ${brew.shareId} - ${brew.title}`, code: 500, HBErrorCode: '71' };
-		};
-
-		brew.lock.reviewRequested = new Date();
-		brew.markModified('lock');
-
-		await brew.save()
-		.catch((error)=>{
-			throw { name: 'Can Not Set Review Request', message: `Unable to set request for review on brew ID ${req.params.id}`, code: 500, HBErrorCode: '69', error };
-		});
-
-		return res.json({ name: 'Review Requested', message: `Review requested on brew ID ${brew.shareId} - ${brew.title}` });
-
-	}));
-
-	router.put('/api/lock/review/remove/:id', mw.adminOnly, asyncHandler(async (req, res)=>{
-
-		const filter = {
-			shareId                : req.params.id,
-			'lock.reviewRequested' : { $exists: 1 }
-		};
-
-		const brew = await HomebrewModel.findOne(filter);
-		if(!brew) { throw { name: 'Can Not Clear Review Request', message: `Brew ID ${req.params.id} does not have a review pending!`, HBErrorCode: '73' }; };
-
-		brew.lock.reviewRequested = undefined;
-		brew.markModified('lock');
-
-		await brew.save()
-		.catch((error)=>{
-			throw { name: 'Can Not Clear Review Request', message: `Unable to remove request for review on brew ID ${req.params.id}`, HBErrorCode: '72', error };
-		});
-
-		return res.json({ name: 'Review Request Cleared', message: `Review request removed for brew ID ${brew.shareId} - ${brew.title}` });
-
-	}));
-
-	// #######################   NOTIFICATIONS
-
-	router.get('/admin/notification/all', async (req, res, next)=>{
-		try {
-			const notifications = await NotificationModel.getAll();
-			return res.json(notifications);
-
-		} catch (error) {
-			console.log('Error getting all notifications: ', error.message);
-			return res.status(500).json({ message: error.message });
-		}
-	});
-
-	router.post('/admin/notification/add', mw.adminOnly, async (req, res, next)=>{
-		try {
-			const notification = await NotificationModel.addNotification(req.body);
-			return res.status(201).json(notification);
-		} catch (error) {
-			console.log('Error adding notification: ', error.message);
-			return res.status(500).json({ message: error.message });
-		}
-	});
-
-	router.delete('/admin/notification/delete/:id', mw.adminOnly, async (req, res, next)=>{
-		try {
-			const notification = await NotificationModel.deleteNotification(req.params.id);
-			return res.json(notification);
-		} catch (error) {
-			console.error('Error deleting notification: { key: ', req.params.id, ' error: ',  error.message, ' }');
-			return res.status(500).json({ message: error.message });
-		}
-	});
-
-	router.get('/admin', mw.adminOnly, asyncHandler(async (req, res)=>{
-		const props = {
-			url : req.originalUrl
-		};
-
-		const htmlPath = isProd
-			? path.resolve('build', 'index.html')
-			: path.resolve('index.html');
-
-		let html = fs.readFileSync(htmlPath, 'utf-8');
-
-		if(!isProd && vite?.transformIndexHtml) {
-			html = await vite.transformIndexHtml(req.originalUrl, html);
-		}
-
-		res.send(html.replace(
-			'<head>',
-			`<head>\n<script id="props">window.__INITIAL_PROPS__ = ${JSON.stringify(props)}</script>`
-		));
-	}));
-
-
-	return router;
-}
-
+	return c.json({ ...saved, text: undefined });
+});
+
+router.get('/admin/user/list/:user', adminOnly, async (c)=>{
+	const username = c.req.param('user');
+	console.log(`[ADMIN] Get brew list for ${username}`);
+	return c.json(await brews(c).listByUser(username, { includeUnpublished: true }));
+});
+
+router.get('/admin/stats', adminOnly, async (c)=>c.json(await brews(c).stats()));
+
+//==== Locks ====//
+
+router.get('/api/lock/count', adminOnly, async (c)=>c.json({ count: await brews(c).countLocked() }));
+
+router.get('/api/locks', adminOnly, async (c)=>c.json({ lockedDocuments: await brews(c).listLocked() }));
+
+router.get('/api/lock/reviews', adminOnly, async (c)=>c.json({ reviewDocuments: await brews(c).listLocked({ reviewRequested: true }) }));
+
+router.post('/api/lock/:id', adminOnly, async (c)=>{
+	const shareId = c.req.param('id');
+	const { overwrite, ...lock } = await c.req.json();
+	lock.applied = new Date();
+
+	const brew = await brews(c).getByShareId(shareId);
+	if(!brew) throw hbError({ name: 'Brew Not Found', message: 'Cannot find brew to lock', shareId, status: 404, HBErrorCode: '63' });
+	if(brew.lock && !overwrite)
+		throw hbError({ name: 'Already Locked', message: 'Lock already exists on brew', shareId, title: brew.title, status: 409, HBErrorCode: '64' });
+
+	await brews(c).setLock(shareId, lock);
+	return c.json({ name: 'LOCKED', message: `Lock applied to brew ID ${brew.shareId} - ${brew.title}`, ...lock });
+});
+
+router.put('/api/unlock/:id', adminOnly, async (c)=>{
+	const shareId = c.req.param('id');
+	const brew = await brews(c).getByShareId(shareId);
+	if(!brew) throw hbError({ name: 'Brew Not Found', message: 'Cannot find brew to unlock', shareId, status: 404, HBErrorCode: '66' });
+	if(!brew.lock) throw hbError({ name: 'Not Locked', message: 'Cannot unlock as brew is not locked', shareId, status: 409, HBErrorCode: '67' });
+
+	await brews(c).setLock(shareId, null);
+	return c.json({ name: 'Unlocked', message: `Lock removed from brew ID ${shareId}` });
+});
+
+// Not admin only: any user can ask for a review of their locked brew
+router.put('/api/lock/review/request/:id', async (c)=>{
+	const shareId = c.req.param('id');
+	const brew = await brews(c).getByShareId(shareId);
+	if(!brew?.lock) throw hbError({ name: 'Brew Not Found', message: `Cannot find a locked brew with ID ${shareId}`, status: 404, HBErrorCode: '70' });
+	if(brew.lock.reviewRequested)
+		throw hbError({ name: 'Review Already Requested', message: `Review already requested for brew ${brew.shareId} - ${brew.title}`, status: 409, HBErrorCode: '71' });
+
+	await brews(c).setLock(shareId, { ...brew.lock, reviewRequested: new Date() });
+	return c.json({ name: 'Review Requested', message: `Review requested on brew ID ${brew.shareId} - ${brew.title}` });
+});
+
+router.put('/api/lock/review/remove/:id', adminOnly, async (c)=>{
+	const shareId = c.req.param('id');
+	const brew = await brews(c).getByShareId(shareId);
+	if(!brew?.lock?.reviewRequested)
+		throw hbError({ name: 'Can Not Clear Review Request', message: `Brew ID ${shareId} does not have a review pending!`, status: 404, HBErrorCode: '73' });
+
+	const lock = { ...brew.lock };
+	delete lock.reviewRequested;
+	await brews(c).setLock(shareId, lock);
+	return c.json({ name: 'Review Request Cleared', message: `Review request removed for brew ID ${brew.shareId} - ${brew.title}` });
+});
+
+//==== Notifications ====//
+
+// Public: the site navbar shows current notifications
+router.get('/admin/notification/all', async (c)=>c.json(await c.get('stores').notifications.getAll()));
+
+router.post('/admin/notification/add', adminOnly, async (c)=>{
+	try {
+		return c.json(await c.get('stores').notifications.add(await c.req.json()), 201);
+	} catch (error) {
+		return c.json({ message: error.message }, 400);
+	}
+});
+
+router.delete('/admin/notification/delete/:id', adminOnly, async (c)=>{
+	const notification = await c.get('stores').notifications.remove(c.req.param('id'));
+	if(!notification) return c.json({ message: 'Notification not found' }, 404);
+	return c.json(notification);
+});
+
+export default router;
