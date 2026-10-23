@@ -77,7 +77,8 @@ version cannot both succeed.
 Migrations: the Worker applies pending migrations itself on the first request of each isolate
 (`ensureMigrated`). Each migration runs in one D1 batch together with its `d1_migrations` record,
 so it applies completely or not at all, and concurrent isolates cannot apply it twice. Production
-uses the `homebrewery` database; preview versions of branches use `homebrewery-preview`.
+uses the `homebrewery` database; preview versions of branches use `homebrewery-preview`. Both are
+in the EU jurisdiction (data stays in the EU).
 
 ## Saving a brew
 
