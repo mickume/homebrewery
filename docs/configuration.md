@@ -18,6 +18,10 @@ The Worker is configured in `wrangler.jsonc`:
 The Worker does not read any variables or secrets yet.
 
 The Node.js version for local work and Cloudflare builds is pinned in `.node-version`.
+Cloudflare's build image installs dependencies with its own npm 10.9.2 regardless of
+the Node.js version, and `npm ci` there fails if `package-lock.json` was resolved only
+by npm 11. After changing dependencies, refresh the lockfile with
+`npx npm@10.9.2 install --package-lock-only` and check that `npx npm@10.9.2 ci` succeeds.
 
 ## Node.js server (being replaced)
 
