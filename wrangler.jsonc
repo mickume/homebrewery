@@ -29,9 +29,10 @@
 		"ENVIRONMENT" : "production"
 	},
 
+	// Both databases are in the EU jurisdiction: they only run and store data inside the EU.
 	// The Worker applies pending migrations itself (server/storage/migrate.js)
 	"d1_databases" : [
-		{ "binding": "DB", "database_name": "homebrewery", "database_id": "63abfe96-c07f-4705-8b1c-2d59a4e9de02", "migrations_dir": "migrations" }
+		{ "binding": "DB", "database_name": "homebrewery", "database_id": "a81f2dea-f09c-402a-96db-e5f8632a274e", "migrations_dir": "migrations" }
 	],
 
 	// Live share-page updates (worker/brewUpdates.js)
@@ -50,7 +51,7 @@
 			"ENVIRONMENT" : "preview"
 		},
 		"d1_databases" : [
-			{ "binding": "DB", "database_name": "homebrewery-preview", "database_id": "ac9066b1-0a92-4feb-b304-052d5ec143d7", "migrations_dir": "migrations" }
+			{ "binding": "DB", "database_name": "homebrewery-preview", "database_id": "9ee6a3d8-6c9e-43a2-8c55-3faf6b93b653", "migrations_dir": "migrations" }
 		],
 		"durable_objects" : {
 			"bindings" : [
