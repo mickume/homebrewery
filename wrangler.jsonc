@@ -24,6 +24,10 @@
 		{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }
 	],
 
+	// Required by `wrangler preview`, the deploy command Workers Builds runs for non-production
+	// branches. Empty: previews inherit the top-level settings.
+	"previews" : {},
+
 	"workers_dev"   : true,
 	"observability" : {
 		"enabled" : true

@@ -14,6 +14,7 @@ The Worker is configured in `wrangler.jsonc`:
 | `assets.binding` | `ASSETS` | Lets the Worker read `index.html` |
 | `assets.html_handling` | `none` | Keeps `/` from resolving to `build/index.html` |
 | `rules` | `**/*.md` as Text | Bundles markdown page content into the Worker |
+| `previews` | `{}` | Required by `wrangler preview`, which Workers Builds runs for non-`main` branches |
 
 The Worker does not read any variables or secrets yet.
 
