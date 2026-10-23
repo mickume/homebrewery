@@ -9,8 +9,10 @@ export function generateAssetsPlugin(isDev = false) {
 		async buildStart() {
 			const buildDir = path.resolve(process.cwd(), 'build');
 
-			// Copy favicon
+			// Copy favicon, robots.txt and the Workers Static Assets header rules
 			await fs.copy('./client/homebrew/favicon.ico', `${buildDir}/assets/favicon.ico`);
+			await fs.copy('./robots.txt', `${buildDir}/robots.txt`);
+			await fs.copy('./_headers', `${buildDir}/_headers`);
 
 			//Copy this image into multiple paths to avoid server spam where browser requests an image
 			//at the wrong path, gets a 406, then in response requests broken-image which also fails. Error handler

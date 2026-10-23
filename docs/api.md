@@ -1,13 +1,14 @@
 # HTTP API
 
-The Express app serves both HTML pages and a JSON API. While the move to Cloudflare
-Workers is in progress ([ADR 01](adr/01-run-on-cloudflare-workers-with-d1.md)), the
-Worker serves only the routes marked **Worker**; it answers every other route with
-`503 {"message": "This route has not been migrated to Cloudflare Workers yet."}`.
-The Node.js server serves all routes below except `/api/health`.
+The Worker serves HTML pages and a JSON API. Files in `build/` (bundles, themes, fonts, images,
+`robots.txt`) are served by Workers Static Assets before any of these routes.
 
-Brew write routes require the `Homebrewery-Version` header to equal the server version
-(`412` otherwise). Accounts come from the `nc_session` JWT cookie.
+Brew write routes require the `Homebrewery-Version` header to equal the server version (`412`
+otherwise). The signed-in account comes from the `nc_session` cookie (see
+[architecture](architecture.md#accounts-and-admin)). Errors are JSON on `/api/*` paths (`HBErrorCode`,
+`name`, `message`, `status` and details) and the error page elsewhere. Unknown `/api/*` routes
+answer 404; unknown pages redirect to `/`. Requests whose `Accept` header asks only for images
+answer 406.
 
 ## Pages
 
@@ -15,12 +16,12 @@ All page routes return `index.html` with `window.__INITIAL_PROPS__` injected.
 
 | Route | Page |
 |---|---|
-| `GET /` | Home page (**Worker**) |
+| `GET /` | Home page |
 | `GET /legacy`, `/migrate`, `/changelog`, `/faq` | Static content pages |
 | `GET /new`, `GET /new/:shareId` | New brew, optionally cloned from a shared brew |
-| `GET /edit/:editId` | Editor (authors and invited authors only) |
-| `GET /share/:shareId` | Read-only brew; increments the view count for non-authors |
-| `GET /user/:username` | A user's brews (unpublished ones only for the owner) |
+| `GET /edit/:editId` | Editor (owner, authors and invited authors; anyone for brews without authors) |
+| `GET /share/:shareId` | Read-only brew; counts a view unless an author looks |
+| `GET /user/:username` | A user's brews (unpublished ones and edit links only for the user) |
 | `GET /account` | Account details (`401` when signed out) |
 | `GET /vault` | Brew search |
 | `GET /admin` | Admin tools (basic auth) |
@@ -29,36 +30,38 @@ All page routes return `index.html` with `window.__INITIAL_PROPS__` injected.
 
 | Route | Purpose |
 |---|---|
-| `POST /api` | Create a brew; returns the saved brew including `editId` and `shareId` |
-| `PUT /api/update/:editId` (alias `PUT /api/:editId`) | Save patches; `409` on version or hash mismatch |
-| `GET /api/remove/:editId` (alias `DELETE /api/:editId`) | Remove the caller as author; deletes the brew when no authors remain |
-| `GET /api/fetch/:shareId` | Brew JSON for the share page |
-| `GET /api/theme/:renderer/:id` | Theme bundle: styles and snippets of a theme and its parents |
+| `POST /api` | Create a brew from a JSON brew; returns it with `editId` and `shareId` |
+| `PUT /api/update/:editId` | Save. Body: the brew (may be gzip-compressed with `Content-Encoding: gzip`) with `version`, `hash` (SHA-256 hex of the last saved text) and `patches`. `409` on a version or hash mismatch; `413` (`HBErrorCode` 14) when too large. Returns the brew without its text |
+| `DELETE /api/:editId` | Remove the signed-in user from the authors; deletes the brew when no authors remain. `204` |
+| `GET /api/fetch/:shareId` | `{ brew }` for the share page (with `editId` only for authors) |
+| `GET /api/theme/:renderer/:id` | Theme bundle: `{ styles, snippets, name, author }` of a theme and its parents |
 | `GET /metadata/:shareId` | Public brew metadata |
-| `GET /css/:shareId` | Brew style as `text/css` |
+| `GET /css/:shareId` | Brew style as `text/css` (`404` without style) |
 | `GET /source/:shareId` | Brew text as escaped HTML |
 | `GET /download/:shareId` | Brew text as a `.txt` attachment |
-| `GET /api/stream/:shareId` | Server-sent events announcing brew updates |
-| `PUT /api/user/rename` | Rename the signed-in user on all their brews |
-| `GET /api/vault`, `GET /api/vault/total` | Search published brews (`title`, `author`, `legacy`, `v3`, `page`, `count`, `sort`, `dir`) |
+| `GET /api/stream/:shareId` | WebSocket upgrade for live updates: messages `{"event":"brewUpdated","shareId","version","time"}`; send `ping` to get `pong`. `426` without an upgrade header |
+| `PUT /api/user/rename` | `{ username, newUsername }`: rename the signed-in user (`newUsername`) on all their brews |
+| `GET /api/vault` | Search published brews: `title` (every word must appear), `author`, `legacy`, `v3`, `page`, `count` (10–100), `sort` (`title`, `createdAt`, `updatedAt`, `views`, `lastViewed`, `pageCount`), `dir`. Returns `{ brews, page }`; email-address authors appear as `hidden` |
+| `GET /api/vault/total` | `{ totalBrews }` for the same filters |
 | `PUT /api/lock/review/request/:shareId` | Request review of a locked brew |
-| `POST /local/login` | Local environments only: returns a session token for `username` |
-| `GET /api/health` | `{"status": "ok", "version": "..."}` (**Worker**) |
+| `POST /local/login` | Local development only: `{ username }` → session token |
 
 ## Admin
 
-Basic auth with `ADMIN_USER` / `ADMIN_PASS`.
+HTTP basic auth with `ADMIN_USER` / `ADMIN_PASSWORD`; `401` without valid credentials or when no
+admin password is configured.
 
 | Route | Purpose |
 |---|---|
-| `GET`/`POST /admin/cleanupJunk` | List / delete tiny brews untouched for 30 days |
-| `GET`/`POST /admin/cleanupLost` | List / delete authorless brews untouched for 2 years |
+| `GET`/`POST /admin/cleanupJunk` | List / delete (at most 300) brews untouched for 30 days with under 140 compressed bytes |
+| `GET`/`POST /admin/cleanupLost` | List / delete (at most 500) authorless brews untouched for 2 years |
 | `GET /admin/lookup/:id` | Find a brew by edit or share id |
-| `GET /admin/finduncompressed`, `PUT /admin/compress/:id` | Find / compress brews with uncompressed text |
-| `PUT /admin/clean/script/:shareId` | Strip `<script` from a brew |
-| `GET /admin/user/list/:user` | List a user's brews |
-| `GET /admin/stats` | Total and published brew counts |
+| `PUT /admin/clean/script/:id` | Strip `<script` / `</script` from a brew's text, title and description |
+| `GET /admin/user/list/:user` | A user's brews, including unpublished |
+| `GET /admin/stats` | `{ totalBrews, totalPublishedBrews }` |
 | `GET /api/lock/count`, `GET /api/locks`, `GET /api/lock/reviews` | Locked brews and review requests |
-| `POST /api/lock/:shareId`, `PUT /api/unlock/:shareId` | Lock / unlock a brew |
+| `POST /api/lock/:shareId` | Lock a brew (body: `code`, `shareMessage`, `editMessage`, optional `overwrite`) |
+| `PUT /api/unlock/:shareId` | Unlock a brew |
 | `PUT /api/lock/review/remove/:shareId` | Clear a review request |
-| `GET /admin/notification/all`, `POST /admin/notification/add`, `DELETE /admin/notification/delete/:key` | Site notifications |
+| `POST /admin/notification/add`, `DELETE /admin/notification/delete/:dismissKey` | Manage site notifications |
+| `GET /admin/notification/all` | Site notifications (public; the navbar shows them) |

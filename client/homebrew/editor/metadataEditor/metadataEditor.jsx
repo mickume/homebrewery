@@ -104,7 +104,7 @@ const MetadataEditor = ({
 			if(!confirm('Are you REALLY sure? You will lose editor access to this document.')) return;
 		}
 
-		request.delete(`/api/${metadata.googleId ?? ''}${metadata.editId}`)
+		request.delete(`/api/${metadata.editId}`)
 			.send()
 			.end((err, res)=>{
 				if(err) {

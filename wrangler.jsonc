@@ -3,11 +3,12 @@
 	"name"               : "homebrewery",
 	"main"               : "worker/index.js",
 	"compatibility_date" : "2026-10-01",
-	"compatibility_flags": ["nodejs_compat"],
 
-	// Builds the client bundle into ./build before every `wrangler dev` / `wrangler deploy`
+	// Builds the client bundle into ./build before every `wrangler dev` / `wrangler deploy`;
+	// `wrangler dev` rebuilds when the client sources change
 	"build" : {
-		"command" : "npm run build"
+		"command"   : "npm run build",
+		"watch_dir" : ["client", "shared", "themes/V3", "themes/Legacy", "index.html"]
 	},
 
 	// Static client assets. Requests matching a file in ./build are served without invoking
@@ -19,14 +20,44 @@
 		"html_handling" : "none"
 	},
 
-	// Markdown page content is bundled into the Worker as text modules
+	// Page markdown and schema migrations are bundled into the Worker as text modules
 	"rules" : [
-		{ "type": "Text", "globs": ["**/*.md"], "fallthrough": true }
+		{ "type": "Text", "globs": ["**/*.md", "**/*.sql"], "fallthrough": true }
 	],
 
-	// Required by `wrangler preview`, the deploy command Workers Builds runs for non-production
-	// branches. Empty: previews inherit the top-level settings.
-	"previews" : {},
+	"vars" : {
+		"ENVIRONMENT" : "production"
+	},
+
+	// The Worker applies pending migrations itself (server/storage/migrate.js)
+	"d1_databases" : [
+		{ "binding": "DB", "database_name": "homebrewery", "database_id": "63abfe96-c07f-4705-8b1c-2d59a4e9de02", "migrations_dir": "migrations" }
+	],
+
+	// Live share-page updates (worker/brewUpdates.js)
+	"durable_objects" : {
+		"bindings" : [
+			{ "name": "BREW_UPDATES", "class_name": "BrewUpdates" }
+		]
+	},
+	"migrations" : [
+		{ "tag": "v1", "new_sqlite_classes": ["BrewUpdates"] }
+	],
+
+	// Branch builds (`wrangler preview`) get their own database, so previews never touch production data
+	"previews" : {
+		"vars" : {
+			"ENVIRONMENT" : "preview"
+		},
+		"d1_databases" : [
+			{ "binding": "DB", "database_name": "homebrewery-preview", "database_id": "ac9066b1-0a92-4feb-b304-052d5ec143d7", "migrations_dir": "migrations" }
+		],
+		"durable_objects" : {
+			"bindings" : [
+				{ "name": "BREW_UPDATES", "class_name": "BrewUpdates" }
+			]
+		}
+	},
 
 	"workers_dev"   : true,
 	"preview_urls"  : true,

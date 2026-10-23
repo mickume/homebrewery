@@ -26,7 +26,19 @@ Do not implement anything before completing these steps.
 ## Repository Layout
 
 ```
-TBD
+worker/            Cloudflare Worker entry (index.js) and BrewUpdates Durable Object
+server/            Hono app (app.js), route modules (*.api.js, page-routes.js), render.js
+  middleware/      request context (config, D1 stores, account), version check, content negotiation
+  storage/         D1 stores (brewStore, notificationStore) and the migration runner
+migrations/        D1 schema migrations (list new ones in server/storage/migrations.js)
+client/            React client: homebrew/ (pages, editor, renderer, navbar), admin/, components/
+shared/            code used by client and Worker (markdown helpers, hashing)
+themes/            brew themes (LESS, snippets, fonts, assets), compiled into build/
+vitePlugins/       build plugin: themes, fonts, assets, robots.txt, _headers into build/
+tests/             Jest tests; tests/support/ has the test app and D1 test databases
+docs/              architecture, configuration, api, cli, adr/
+wrangler.jsonc     Worker config: assets, D1, Durable Object, previews
+Makefile           make check (lint, Worker dry-run build, tests)
 ```
 
 

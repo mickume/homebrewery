@@ -17,6 +17,48 @@ import request from '../../utils/request-middleware.js';
 import { DEFAULT_BREW_LOAD } from '../../../../server/brewDefaults.js';
 import { printCurrentBrew, fetchThemeBundle } from '@shared/helpers.js';
 
+const PING_INTERVAL = 30 * 1000;
+const MAX_RECONNECT_DELAY = 60 * 1000;
+
+// Opens a WebSocket to the brew's live update channel and calls onMessage for each update. Pings keep
+// the connection alive; dropped connections reconnect with backoff. Returns a function that stops it.
+const listenForUpdates = (shareId, onMessage)=>{
+	let socket, pingTimer, reconnectTimer;
+	let stopped = false;
+	let reconnectDelay = 1000;
+
+	const connect = ()=>{
+		const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+		socket = new WebSocket(`${protocol}://${window.location.host}/api/stream/${shareId}`);
+		socket.addEventListener('open', ()=>{
+			reconnectDelay = 1000;
+			pingTimer = setInterval(()=>socket.send('ping'), PING_INTERVAL);
+		});
+		socket.addEventListener('message', (event)=>{
+			if(event.data === 'pong') return;
+			try {
+				onMessage(JSON.parse(event.data));
+			} catch (error) {
+				console.warn('Ignoring malformed brew update:', error);
+			}
+		});
+		socket.addEventListener('close', ()=>{
+			clearInterval(pingTimer);
+			if(stopped) return;
+			reconnectTimer = setTimeout(connect, reconnectDelay);
+			reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
+		});
+	};
+
+	connect();
+	return ()=>{
+		stopped = true;
+		clearInterval(pingTimer);
+		clearTimeout(reconnectTimer);
+		socket?.close();
+	};
+};
+
 const SharePage = (props)=>{
 	const { disableMeta = false } = props;
 
@@ -53,36 +95,25 @@ const SharePage = (props)=>{
 		document.addEventListener('keydown', handleControlKeys);
 		fetchThemeBundle(undefined, setThemeBundle, currentBrew.renderer, currentBrew.theme);
 
-		let eventSource;
-		// Start a stream if the brew has been updated in the last month
-		if(Date.parse(props.brew?.updatedAt) > (new Date).setDate((new Date).getDate() - 30)){
-			// listen for changes in the brew version
-			eventSource = new EventSource(`/api/stream/${props.brew.shareId}`);
-
-			eventSource.addEventListener('brewUpdated', (evt)=>{
-				const messageData = JSON.parse(evt.data);
-
-				if(messageData.version != currentBrew.version) {
-					console.log('should fetch brew');
-					fetchUpdatedBrew();
-				}
-			});
-		}
+		// Listen for new versions if the brew has been updated in the last month
+		const stopListening = Date.parse(props.brew?.updatedAt) > (new Date).setDate((new Date).getDate() - 30)
+			? listenForUpdates(props.brew.shareId, (message)=>{
+				if(message.event === 'brewUpdated' && message.version != currentBrew.version) fetchUpdatedBrew();
+			})
+			: ()=>{};
 
 		return ()=>{
 			document.removeEventListener('keydown', handleControlKeys);
-			eventSource?.close();
+			stopListening();
 		};
 	}, []);
 
-	const processShareId = ()=>{
-		return currentBrew.googleId && !currentBrew.stubbed ? currentBrew.googleId + currentBrew.shareId : currentBrew.shareId;
-	};
+	const processShareId = ()=>currentBrew.shareId;
 
 	const renderEditLink = ()=>{
 		if(!currentBrew.editId) return null;
 
-		const editLink = currentBrew.googleId && ! currentBrew.stubbed ? currentBrew.googleId + currentBrew.editId : currentBrew.editId;
+		const editLink = currentBrew.editId;
 
 		return (
 			<Nav.item color='orange' icon='fas fa-pencil-alt' href={`/edit/${editLink}`}>

@@ -22,10 +22,10 @@ export default function createNotificationStore(db, { now = ()=>new Date() } = {
 			return results.map(toNotification);
 		},
 
-		// Throws { message } when the dismissKey is missing or already used
+		// Throws when the dismissKey is missing or already used
 		add : async (data)=>{
-			if(!data?.dismissKey) throw { message: 'Dismiss key is required!' };
-			if(await get(data.dismissKey)) throw { message: `A notification with dismiss key "${data.dismissKey}" already exists` };
+			if(!data?.dismissKey) throw new Error('Dismiss key is required!');
+			if(await get(data.dismissKey)) throw new Error(`A notification with dismiss key "${data.dismissKey}" already exists`);
 
 			const timestamp = now().toISOString();
 			await db.prepare(`INSERT INTO notifications (dismiss_key, title, text, created_at, start_at, stop_at)

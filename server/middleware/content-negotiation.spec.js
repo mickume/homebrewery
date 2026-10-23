@@ -1,41 +1,19 @@
-import contentNegotiationMiddleware from './content-negotiation.js';
+import { Hono } from 'hono';
+import contentNegotiation from './content-negotiation.js';
 
-describe('content-negotiation-middleware', ()=>{
-	let request;
-	let response;
-	let next;
+describe('content-negotiation middleware', ()=>{
+	const app = new Hono().use(contentNegotiation).get('*', (c)=>c.text('page'));
+	const request = (accept)=>app.request('/somewhere', { headers: { Accept: accept } });
 
-	beforeEach(()=>{
-		request = {
-			get : function(key) {
-				return this[key];
-			}
-		};
-		response = {
-			status : jest.fn(()=>response),
-			send   : jest.fn(()=>{})
-		};
-		next = jest.fn();
+	it('answers 406 to image requests', async ()=>{
+		const res = await request('image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8');
+
+		expect(res.status).toBe(406);
+		expect(await res.json()).toEqual({ message: 'Request for image at this URL is not supported' });
 	});
 
-	it('should return 406 on image request', ()=>{
-		contentNegotiationMiddleware({
-			Accept : 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-			...request
-		}, response);
-
-		expect(response.status).toHaveBeenLastCalledWith(406);
-		expect(response.send).toHaveBeenCalledWith({
-			message : 'Request for image at this URL is not supported'
-		});
-	});
-
-	it('should call next on non-image request', ()=>{
-		contentNegotiationMiddleware({
-			Accept : 'text,image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
-			...request
-		}, response, next);
-
-		expect(next).toHaveBeenCalled();
+	it('passes other requests on', async ()=>{
+		const res = await request('text,image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8');
+		expect(await res.text()).toBe('page');
 	});
 });

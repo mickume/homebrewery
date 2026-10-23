@@ -1,16 +1,14 @@
-import config from '../config.js';
-const nodeEnv = config.get('node_env');
-const isLocalEnvironment = config.get('local_environments').includes(nodeEnv);
-
-export default (req, res, next)=>{
-	const isImageRequest = req.get('Accept')?.split(',')
-        ?.filter((h)=>!h.includes('q='))
-        ?.every((h)=>/image\/.*/.test(h));
-	if(isImageRequest && !(isLocalEnvironment && req.url?.startsWith('/staticImages'))) {
-		return res.status(406).send({
+// Image requests that reach the Worker are for files that do not exist (existing files are served by
+// Workers Static Assets first). Answer them with 406 instead of an HTML page the browser cannot render.
+export default async (c, next)=>{
+	const isImageRequest = c.req.header('Accept')?.split(',')
+		?.filter((h)=>!h.includes('q='))
+		?.every((h)=>/image\/.*/.test(h));
+	if(isImageRequest) {
+		return c.json({
 			message : 'Request for image at this URL is not supported'
-		});
+		}, 406);
 	}
 
-	next();
+	await next();
 };

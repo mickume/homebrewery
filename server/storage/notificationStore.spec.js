@@ -39,10 +39,10 @@ describe.each(testDatabases)('notificationStore on %s', (name, openDatabase)=>{
 	});
 
 	it('requires a unique dismiss key', async ()=>{
-		await expect(store.add({ title: 'No key' })).rejects.toEqual({ message: 'Dismiss key is required!' });
+		await expect(store.add({ title: 'No key' })).rejects.toThrow('Dismiss key is required!');
 
 		await store.add({ dismissKey: 'a' });
-		await expect(store.add({ dismissKey: 'a' })).rejects.toMatchObject({ message: expect.stringContaining('already exists') });
+		await expect(store.add({ dismissKey: 'a' })).rejects.toThrow('already exists');
 	});
 
 	it('removes a notification and returns it', async ()=>{
